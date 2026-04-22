@@ -188,25 +188,128 @@ pub fn dc_edge<T: Frame>(
 
         let verts = verts.map(Option::unwrap);
 
-        // Pick the intersection vertex based on the deepest cell
-        let i = out.vertex(
-            leafs[deepest].index + verts[deepest].edge.0 as usize,
-            &octree.verts,
-        );
-        // Helper function to extract other vertices
-        let mut vert = |i: usize| {
-            out.vertex(leafs[i].index + verts[i].vert.0 as usize, &octree.verts)
-        };
-        let vs = [vert(0), vert(1), vert(2), vert(3)];
-
-        // Pick a triangle winding depending on the edge direction
+        // -------------------------------------------------------------------
+        // Morphé patch: libfive-style quad-split dual emission
         //
-        // As always, we have to sample the deepest leaf's edge to be sure that
-        // we get the correct value.
-        let winding = if starting_sign { 3 } else { 1 };
-        for j in 0..4 {
-            if cs[j].index != cs[(j + winding) % 4].index {
-                out.triangle(vs[j], vs[(j + winding) % 4], i)
+        // Upstream Fidget emits a FAN of up to 4 triangles anchored at the
+        // on-surface edge-intersection vertex `i` (see `leafs[deepest]
+        // .edge`).  Because each cell's QEF feature vertex lives *inside*
+        // its cell, the four QEF vertices bounding a shared edge can sit
+        // at significantly different positions relative to the on-surface
+        // point, which produces tiny fold / flap triangles on any curved
+        // surface — the classic Fidget DC artifact.
+        //
+        // libfive instead walks the 4 cells' QEF vertices directly as a
+        // quad and splits it along the diagonal whose resulting pair of
+        // triangles is the most co-planar.  This halves triangle count
+        // and structurally prevents flap-fold topology.  See
+        // `libfive/src/render/brep/dc/dc_mesher.cpp` — the
+        // `norms[0].dot(norms[3]) > norms[1].dot(norms[2])` heuristic.
+        //
+        // We use *face* normals of the candidate triangles (purely
+        // topological, no shape evaluation needed) rather than libfive's
+        // per-vertex surface normals.  This is a strictly stronger
+        // flap-suppressor since flaps are exactly the case where the
+        // two face normals oppose; the heuristic eliminates them by
+        // construction.
+        // -------------------------------------------------------------------
+
+        // Collect mesh indices + world positions for the 4 corner vertices
+        let abs = [
+            leafs[0].index + verts[0].vert.0 as usize,
+            leafs[1].index + verts[1].vert.0 as usize,
+            leafs[2].index + verts[2].vert.0 as usize,
+            leafs[3].index + verts[3].vert.0 as usize,
+        ];
+        let vs = [
+            out.vertex(abs[0], &octree.verts),
+            out.vertex(abs[1], &octree.verts),
+            out.vertex(abs[2], &octree.verts),
+            out.vertex(abs[3], &octree.verts),
+        ];
+        let ps = [
+            octree.verts[abs[0]].pos,
+            octree.verts[abs[1]].pos,
+            octree.verts[abs[2]].pos,
+            octree.verts[abs[3]].pos,
+        ];
+
+        // Cyclic winding order.  Fidget's original code used
+        // `winding = 3` for `starting_sign == true` (== -1 mod 4), so
+        // slot j stepped to j-1; we preserve the same orientation here
+        // so emitted triangle normals still point outward.
+        let order: [usize; 4] = if starting_sign {
+            [0, 3, 2, 1]
+        } else {
+            [0, 1, 2, 3]
+        };
+
+        // Collapse consecutive slots whose cells refer to the same
+        // octree cell (level-of-detail collapses at neighbour
+        // boundaries): those slots carry the same QEF vertex, so the
+        // polygon degenerates.
+        let mut loop_slots: [usize; 4] = [0; 4];
+        let mut loop_len = 0usize;
+        for &s in &order {
+            let same_as_prev = if loop_len == 0 {
+                false
+            } else {
+                cs[loop_slots[loop_len - 1]].index == cs[s].index
+            };
+            if !same_as_prev {
+                loop_slots[loop_len] = s;
+                loop_len += 1;
+            }
+        }
+        // Wrap-around dedup (first == last after a full walk)
+        if loop_len > 1
+            && cs[loop_slots[0]].index == cs[loop_slots[loop_len - 1]].index
+        {
+            loop_len -= 1;
+        }
+
+        // Face-normal helper.  Returns zero vector for degenerate
+        // triangles; dot-product comparison handles that gracefully.
+        let tri_normal = |a: nalgebra::Vector3<f32>,
+                          b: nalgebra::Vector3<f32>,
+                          c: nalgebra::Vector3<f32>|
+         -> nalgebra::Vector3<f32> {
+            let n = (b - a).cross(&(c - a));
+            let m = n.norm();
+            if m > 1e-30 { n / m } else { n }
+        };
+
+        match loop_len {
+            3 => {
+                let (a, b, c) =
+                    (loop_slots[0], loop_slots[1], loop_slots[2]);
+                out.triangle(vs[a], vs[b], vs[c]);
+            }
+            4 => {
+                let (a, b, c, d) = (
+                    loop_slots[0],
+                    loop_slots[1],
+                    loop_slots[2],
+                    loop_slots[3],
+                );
+                // Diagonal AC: triangles (a,b,c) + (a,c,d)
+                // Diagonal BD: triangles (a,b,d) + (b,c,d)
+                let n_ac_1 = tri_normal(ps[a], ps[b], ps[c]);
+                let n_ac_2 = tri_normal(ps[a], ps[c], ps[d]);
+                let n_bd_1 = tri_normal(ps[a], ps[b], ps[d]);
+                let n_bd_2 = tri_normal(ps[b], ps[c], ps[d]);
+                let score_ac = n_ac_1.dot(&n_ac_2);
+                let score_bd = n_bd_1.dot(&n_bd_2);
+                if score_ac >= score_bd {
+                    out.triangle(vs[a], vs[b], vs[c]);
+                    out.triangle(vs[a], vs[c], vs[d]);
+                } else {
+                    out.triangle(vs[a], vs[b], vs[d]);
+                    out.triangle(vs[b], vs[c], vs[d]);
+                }
+            }
+            _ => {
+                // 0, 1, or 2 unique cells -> no triangle
             }
         }
     } else {

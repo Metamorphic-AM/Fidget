@@ -54,12 +54,43 @@ mod output;
 mod qef;
 
 use fidget_core::render::{CancelToken, ThreadPool};
+use std::sync::Arc;
 
 #[doc(hidden)]
 pub mod types;
 
 // Re-export the main Octree type as public
 pub use octree::Octree;
+
+/// Callback supplying additional QEF plane constraints at each edge
+/// zero-crossing processed by the MDC leaf vertex-placement routine.
+///
+/// At a sharp crease or corner in a mesh-backed oracle, Fidget's own
+/// gradient-slice evaluator only returns a single outward normal — one side
+/// of the crease — which leaves the QEF solver a single-plane problem and
+/// the resulting vertex blunts the feature.  A hook of this type may be
+/// installed on [`Settings`] so the meshing pipeline can ask an external
+/// oracle (in Morphé's case, the FCPW mesh oracle reached through the C++
+/// FFI) for the *full* list of outward face normals meeting at the closest
+/// point.  Each returned plane is accumulated into the cell's QEF in
+/// addition to the primary gradient, letting the solver locate the sharp
+/// edge / corner exactly.
+///
+/// Arguments:
+/// - `pos`         — intersection position in model space `[x, y, z]`.
+/// - `cell_extent` — the containing cell's edge-length extent in model
+///                   space `[x, y, z]`.  Callers may use this to scope any
+///                   internal spatial query.
+///
+/// Return value: a list of `[nx, ny, nz, offset_d]` plane equations.  Each
+/// entry is fed to the QEF via an additional `add_intersection` call at the
+/// given position with the given outward normal.  Returning an empty vec is
+/// equivalent to having no hook installed for this cell.
+///
+/// The closure is shared across rayon workers during parallel octree
+/// construction, hence `Send + Sync`.
+pub type FeaturesFn =
+    Arc<dyn Fn([f32; 3], [f32; 3]) -> Vec<[f32; 4]> + Send + Sync>;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -95,6 +126,19 @@ pub struct Settings<'a> {
 
     /// Token to cancel rendering
     pub cancel: CancelToken,
+
+    /// Optional callback supplying additional QEF plane constraints at each
+    /// edge zero-crossing during MDC leaf vertex placement.
+    ///
+    /// When `None` (the default), the QEF is solved using only the single
+    /// gradient Fidget's grad-slice evaluator produces at each edge — the
+    /// original single-normal behaviour, unchanged from upstream.
+    ///
+    /// When `Some(...)`, the closure is invoked at each edge intersection
+    /// with the position and cell extent, and every returned plane is
+    /// accumulated into the cell's QEF in addition to the primary gradient.
+    /// See [`FeaturesFn`] for full semantics.
+    pub features_at: Option<FeaturesFn>,
 }
 
 impl Default for Settings<'_> {
@@ -104,6 +148,7 @@ impl Default for Settings<'_> {
             world_to_model: nalgebra::Matrix4::identity(),
             threads: Some(&ThreadPool::Global),
             cancel: CancelToken::new(),
+            features_at: None,
         }
     }
 }

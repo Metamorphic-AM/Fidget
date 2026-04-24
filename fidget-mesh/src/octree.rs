@@ -95,23 +95,40 @@ impl Octree {
                 settings.depth,
                 &settings.cancel,
                 threads,
+                settings.features_at.as_ref(),
             )
         } else {
             let mut eval = RenderHandle::new(shape.clone());
             let mut out = OctreeBuilder::new();
+            // Propagate the Morphé multi-gradient QEF hook (if installed)
+            // from `Settings` onto the builder, so the single-threaded
+            // vertex-placement path in `leaf` / `flush_deferred_leaves`
+            // can see it.  Cloning `Option<Arc<dyn Fn>>` is an Arc bump.
+            out.features_at = settings.features_at.clone();
             let mut hermite = LeafHermiteData::default();
-            if out.recurse(
+            if !out.recurse(
                 &mut eval,
                 vars,
                 CellIndex::default(),
                 settings.depth,
                 &settings.cancel,
                 &mut hermite,
+                false, // in_batch — no outer batch window
+                None,  // parent_ctx — root call, no parent octree row
             ) {
-                Some(out.octree)
-            } else {
-                None
+                return None;
             }
+            // Z1: final flush catches any deferred leaves that weren't resolved
+            // by an inner simplification-boundary flush (e.g. trees shallower
+            // than the first simplification depth).
+            if !out.flush_deferred_leaves(
+                &mut eval,
+                vars,
+                &settings.cancel,
+            ) {
+                return None;
+            }
+            Some(out.octree)
         }
     }
 
@@ -122,6 +139,7 @@ impl Octree {
         max_depth: u8,
         cancel: &CancelToken,
         threads: &ThreadPool,
+        features_at: Option<&crate::FeaturesFn>,
     ) -> Option<Self> {
         let mut root = Octree::new();
         let mut todo = VecDeque::new();
@@ -160,7 +178,16 @@ impl Octree {
         let out = threads.run(|| {
             todo.par_iter()
                 .map_init(
-                    || (OctreeBuilder::new(), rh.clone()),
+                    || {
+                        let mut builder = OctreeBuilder::new();
+                        // Share the Morphé multi-gradient QEF hook (if
+                        // installed) with every rayon worker.  Each worker
+                        // gets its own Arc handle; the underlying closure
+                        // must be `Send + Sync`, which `FeaturesFn`
+                        // guarantees at the type level.
+                        builder.features_at = features_at.cloned();
+                        (builder, rh.clone())
+                    },
                     |(builder, eval), cell| {
                         let mut hermite = LeafHermiteData::default();
                         // Patch our cell so that it builds at index 0
@@ -175,7 +202,15 @@ impl Octree {
                             max_depth,
                             cancel,
                             &mut hermite,
+                            false, // in_batch — no outer batch window
+                            None,  // parent_ctx — worker root, no parent row
                         ) {
+                            return None;
+                        }
+                        // Z1: final flush catches any deferred leaves that
+                        // weren't resolved by an inner simplification-boundary
+                        // flush.
+                        if !builder.flush_deferred_leaves(eval, vars, cancel) {
                             return None;
                         }
                         let octree = std::mem::replace(
@@ -364,7 +399,14 @@ impl Octree {
         //   have been collapsed into a single empty / full cell
         // - The interior vertices *do not* match, in which case the
         //   cell should not be marked as collapsible.
-        let (pos, new_err) = hermite.solve();
+        // Scale the mass-point acceptance threshold to this merged cell's
+        // extent — for collapse the relevant cell is the parent, whose
+        // bounds are `cell.bounds`.
+        let bounds = &cell.bounds.bounds;
+        let cell_extent_scalar = (bounds[0].upper() - bounds[0].lower())
+            .max(bounds[1].upper() - bounds[1].lower())
+            .max(bounds[2].upper() - bounds[2].lower());
+        let (pos, new_err) = hermite.solve(cell_extent_scalar);
         if new_err >= hermite.qef_err * 2.0 || !cell.bounds.contains(pos) {
             return None;
         }
@@ -493,8 +535,36 @@ impl std::ops::IndexMut<CellIndex<3>> for Octree {
     }
 }
 
+/// Z1: a leaf-cell whose evaluation has been deferred so that many leaves can
+/// be processed in a single pipelined pass (corner batch → edge-search batch ×4
+/// → gradient batch → per-cell QEF solve).
+///
+/// The queued cell has `Cell::Invalid` written to `self.octree[cell]` as a
+/// placeholder; the flush pass replaces it with the real `Cell::Empty`,
+/// `Cell::Full`, or `Cell::Leaf(..)` value.
+///
+/// `parent_idx` and `corner_idx` pin the queued cell to its slot in
+/// `self.octree.cells[parent_idx][corner_idx]`, and are the address that
+/// flush phase 5 uses to write this leaf's `LeafHermiteData` into
+/// `self.hermite_cells[parent_idx][corner_idx]`.  That hermite entry is
+/// consumed later by `collapse_subtree()` so `try_collapse` can run
+/// bottom-up across the flushed subtree, restoring MDC's adaptive
+/// coarsening on top of the batched-evaluation win.
+#[derive(Copy, Clone, Debug)]
+struct DeferredLeaf {
+    cell: CellIndex<3>,
+    parent_idx: usize,
+    corner_idx: u8,
+}
+
 /// Data structure for an under-construction octree
-#[derive(Debug)]
+//
+// Note: cannot `#[derive(Debug)]` because `features_at: Option<FeaturesFn>`
+// holds a `dyn Fn(...)` trait object, and `Fn` trait objects don't implement
+// `Debug`.  The manual impl below mirrors what the derive would have produced
+// for the other fields and replaces the closure with a `<closure>` placeholder
+// so the struct can still participate in tracing / `{:?}` debug prints
+// wherever callers reach for them.
 pub(crate) struct OctreeBuilder<F: Function + RenderHints> {
     /// In-construction octree
     pub(crate) octree: Octree,
@@ -506,6 +576,81 @@ pub(crate) struct OctreeBuilder<F: Function + RenderHints> {
     tape_storage: Vec<F::TapeStorage>,
     shape_storage: Vec<F::Storage>,
     workspace: F::Workspace,
+
+    /// Z1: queue of leaves pending a pipelined batch evaluation.
+    ///
+    /// Filled by `recurse()` at `cell.depth == max_depth` when a batching
+    /// window is active; drained by `flush_deferred_leaves()` at the
+    /// simplification boundary that opened the window.
+    deferred_leaves: Vec<DeferredLeaf>,
+
+    /// Z1: per-branch hermite data, sharing the row-index space with
+    /// `self.octree.cells`.  Used only inside a batching window, because
+    /// scalar recursion propagates hermite via stack-local `&mut
+    /// LeafHermiteData` parameters and doesn't need this storage.  For each
+    /// parent-branch `p` and corner `c` in 0..8:
+    ///
+    /// * If `self.octree.cells[p][c]` is `Cell::Leaf`, then
+    ///   `self.hermite_cells[p][c]` holds that leaf's real hermite data
+    ///   (populated by `flush_deferred_leaves` phase 5).
+    /// * If it's `Cell::Full` or `Cell::Empty`, the hermite entry stays at
+    ///   default, which is the correct contribution for `merge()` (empty
+    ///   intersections, `qef_err = QEF_ERR_EMPTY`).
+    /// * If it's `Cell::Branch`, the hermite entry is unused; the inner
+    ///   branch's hermite is produced on-demand by a recursive
+    ///   `collapse_subtree` call.
+    ///
+    /// Growth strategy is lazy: `recurse` does NOT push a row here alongside
+    /// every `octree.cells.push(..)` because each `[LeafHermiteData; 8]`
+    /// entry is ~7 KB and scalar-only builds would pay that cost for
+    /// nothing.  Instead, `flush_deferred_leaves` resizes this `Vec` up to
+    /// `octree.cells.len()` at the start of each flush.  Every branch
+    /// inside the active window exists by the time flush runs (flush is
+    /// called at the window root, after all 8 children recursed), so the
+    /// resize covers every index that the subsequent `collapse_subtree`
+    /// pass will read.  Entries outside an active batching window are
+    /// meaningless and should not be read.
+    hermite_cells: Vec<[LeafHermiteData; 8]>,
+
+    /// Optional hook supplying additional QEF plane constraints at each edge
+    /// zero-crossing in the leaf vertex-placement routine.
+    ///
+    /// Mirrors [`crate::Settings::features_at`] — populated from it when the
+    /// builder is instantiated for a given build.  `None` preserves the
+    /// upstream single-normal QEF behaviour; `Some(...)` enables the
+    /// multi-gradient extension used by Morphé's FCPW mesh-SDF oracle so the
+    /// QEF can snap to sharp creases and corners.
+    ///
+    /// The closure is `Arc`-wrapped so it can be cheaply shared across rayon
+    /// workers (one `Arc::clone` per worker during `build_inner_mt`).
+    pub(crate) features_at: Option<crate::FeaturesFn>,
+}
+
+impl<F: Function + RenderHints> std::fmt::Debug for OctreeBuilder<F> {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        // Only print the fields whose types don't depend on `F`'s associated
+        // types — `ShapeBulkEval<F::FloatSliceEval>` and friends don't carry
+        // `Debug` bounds on their generics, so explicitly formatting them
+        // would force us to add `where F::FloatSliceEval: Debug` (etc.)
+        // clauses here and propagate them to every caller.  The original
+        // `#[derive(Debug)]` silently emitted those bounds into its generated
+        // impl, but our hand-written impl doesn't get that treatment for
+        // free.  These fields are internal evaluator scratch state and
+        // wouldn't be meaningful in debug output anyway; `finish_non_exhaustive`
+        // signals the partial view.
+        f.debug_struct("OctreeBuilder")
+            .field("octree", &self.octree)
+            .field("deferred_leaves_len", &self.deferred_leaves.len())
+            .field("hermite_cells_len", &self.hermite_cells.len())
+            .field(
+                "features_at",
+                &self.features_at.as_ref().map(|_| "<closure>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl<F: Function + RenderHints> Default for OctreeBuilder<F> {
@@ -525,6 +670,9 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
             tape_storage: vec![],
             shape_storage: vec![],
             workspace: Default::default(),
+            deferred_leaves: vec![],
+            hermite_cells: vec![],
+            features_at: None,
         }
     }
 
@@ -533,6 +681,21 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
     /// Writes to `self.o.cells[cell]`, which must be reserved
     ///
     /// If a leaf is written, then `hermite` is populated
+    ///
+    /// The `in_batch` flag indicates whether any ancestor has opened a
+    /// batching window via `simplify_tree_during_meshing`. When true, leaves
+    /// at `max_depth` are pushed onto `self.deferred_leaves` instead of being
+    /// processed inline; they are flushed at the recurse frame that opened
+    /// the window.
+    ///
+    /// `parent_ctx` is `Some((parent_idx, corner_idx))` whenever this frame
+    /// was called from another recurse frame that had reserved a row in
+    /// `self.octree.cells` for its 8 children.  It is the address of this
+    /// frame's slot in its parent's cells row, and `DeferredLeaf` entries
+    /// carry a copy so that `flush_deferred_leaves` knows which
+    /// `self.hermite_cells[parent_idx][corner_idx]` slot to populate.  The
+    /// single-threaded root call and each multithreaded worker's root call
+    /// pass `None` (they have no parent octree row to write back to).
     ///
     /// Returns `true` if recursion completed normally, or `false` if it was
     /// cancelled.
@@ -545,6 +708,8 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
         max_depth: u8,
         cancel: &CancelToken,
         hermite: &mut LeafHermiteData,
+        in_batch: bool,
+        parent_ctx: Option<(usize, u8)>,
     ) -> bool {
         if cancel.is_cancelled() {
             return false;
@@ -564,6 +729,18 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
         } else if i.lower() > 0.0 {
             Cell::Empty
         } else {
+            // Z1: this frame opens a batching window if `simplify_tree_during_meshing`
+            // fires here AND no ancestor has already opened one. The frame that
+            // opens the window owns the flush at the end of its subtree.
+            //
+            // We only open a window if we actually have descendants to batch
+            // across — if this frame is itself the max-depth leaf, there's
+            // nothing to amortise, and deferring would leave a Cell::Invalid
+            // placeholder that an ancestor's scalar `check_done` would panic
+            // on.
+            let opens_window = F::simplify_tree_during_meshing(cell.depth)
+                && !in_batch
+                && cell.depth != max_depth as usize;
             let sub_tape = if F::simplify_tree_during_meshing(cell.depth) {
                 if let Some(trace) = r.as_ref() {
                     eval.simplify(
@@ -578,32 +755,193 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
             } else {
                 eval
             };
+            let child_in_batch = in_batch || opens_window;
             if cell.depth == max_depth as usize {
-                self.leaf(sub_tape, vars, cell, hermite)
+                if child_in_batch {
+                    // Z1: queue the leaf for pipelined batch evaluation.
+                    // Write Cell::Invalid as a placeholder; flush replaces it.
+                    //
+                    // `parent_ctx` must be Some here: the only way to reach
+                    // `child_in_batch == true` is via a parent frame that
+                    // reserved an octree row and called us with that row's
+                    // (index, corner) pair.
+                    let (parent_idx, corner_idx) = parent_ctx
+                        .expect("deferred leaf reached without a parent slot");
+                    self.deferred_leaves.push(DeferredLeaf {
+                        cell,
+                        parent_idx,
+                        corner_idx,
+                    });
+                    Cell::Invalid
+                } else {
+                    self.leaf(sub_tape, vars, cell, hermite)
+                }
             } else {
-                // Reserve new cells for the 8x children
+                // Reserve new cells for the 8x children.  `hermite_cells` is
+                // NOT grown eagerly here — doing so would allocate ~7 KB
+                // per row even for scalar-only builds, which adds up fast
+                // on deep meshes.  Instead, `flush_deferred_leaves` resizes
+                // `hermite_cells` to match `octree.cells` right before it
+                // writes; all batching-window-internal branches exist by
+                // the time flush runs, so the resize covers every index
+                // that `collapse_subtree` will later read.
                 let index = self.octree.cells.len();
                 self.octree.cells.push([Cell::Invalid; 8]);
                 let mut hermite_child = [LeafHermiteData::default(); 8];
                 for i in Corner::<3>::iter() {
-                    let cell = cell.child(index, i);
+                    let child = cell.child(index, i);
                     if !self.recurse(
                         sub_tape,
                         vars,
-                        cell,
+                        child,
                         max_depth,
                         cancel,
                         &mut hermite_child[i.index()],
+                        child_in_batch,
+                        Some((index, i.index() as u8)),
                     ) {
                         return false;
                     }
                 }
 
-                // Figure out whether the children can be collapsed
-                self.octree.check_done(cell, index, hermite_child, hermite)
+                // Z1: if we opened the batching window here, flush all queued
+                // leaves under this subtree before anything looks at the
+                // cells row — after flush, `self.octree.cells[index][..]` no
+                // longer contains Cell::Invalid placeholders for this
+                // subtree's leaves and `self.hermite_cells[index][..]` has
+                // real hermite data for each flushed leaf.
+                if opens_window
+                    && !self.flush_deferred_leaves(sub_tape, vars, cancel)
+                {
+                    return false;
+                }
+
+                if opens_window {
+                    // Window root: the subtree is fully resolved now, so we
+                    // can run the normal bottom-up try_collapse pass over
+                    // it.  `collapse_subtree` writes the resulting hermite
+                    // into `*hermite` for this frame, exactly matching the
+                    // scalar `check_done` contract.  This is what restores
+                    // MDC's adaptive coarsening on top of Z1's batching —
+                    // without it, every max-depth cell that spans the
+                    // surface sticks around as its own leaf and the mesh
+                    // comes out uniformly dense.
+                    self.collapse_subtree(cell, index, hermite)
+                } else if in_batch {
+                    // Strictly inside a batching window (neither root nor
+                    // scalar).  Leaves may still be deferred somewhere under
+                    // us, so we can't call check_done yet — the window root
+                    // will run collapse_subtree over its own subtree and
+                    // will recurse down through us at that time, at which
+                    // point our row in self.octree.cells will be fully
+                    // populated.  Record ourselves as a plain Branch for
+                    // now; hermite flows through self.hermite_cells rather
+                    // than through `*hermite`.
+                    Cell::Branch { index }
+                } else {
+                    // Scalar path: business as usual.
+                    self.octree.check_done(cell, index, hermite_child, hermite)
+                }
             }
         };
         true
+    }
+
+    /// Z1: bottom-up `try_collapse` traversal of a subtree whose leaves are
+    /// all resolved (no `Cell::Invalid` placeholders).
+    ///
+    /// Called by `recurse` at the frame that opens a batching window, once
+    /// `flush_deferred_leaves` has run.  Walks the subtree rooted at
+    /// `index` in post-order: for each `Cell::Branch` child at corner `c`,
+    /// recursively collapses the sub-subtree (which overwrites
+    /// `self.octree.cells[index][c]` with the collapsed result); for each
+    /// `Cell::Leaf` child, pulls hermite from
+    /// `self.hermite_cells[index][c]`; for `Cell::Full` / `Cell::Empty`,
+    /// uses default hermite (zero contribution to `merge`).
+    ///
+    /// The gathered `[LeafHermiteData; 8]` is then handed to the normal
+    /// `Octree::check_done`, which runs the vanilla `try_collapse` logic —
+    /// including QEF-error gating and the tail-of-array cleanup — and
+    /// writes the merged result into `*hermite_out`.  The returned
+    /// `Cell<3>` is the new value for this frame's slot in its parent's
+    /// row; the caller is responsible for writing it.
+    ///
+    /// Never descends into leaves, never re-evaluates the shape — it is a
+    /// pure post-processing pass over the octree and hermite arrays.
+    fn collapse_subtree(
+        &mut self,
+        cell: CellIndex<3>,
+        index: usize,
+        hermite_out: &mut LeafHermiteData,
+    ) -> Cell<3> {
+        let mut hermite_child = [LeafHermiteData::default(); 8];
+        for i in 0..8 {
+            match self.octree.cells[index][i] {
+                Cell::Branch { index: child_idx } => {
+                    let child_cell =
+                        cell.child(index, Corner::<3>::new(i as u8));
+                    let mut child_hermite = LeafHermiteData::default();
+                    let new_cell = self.collapse_subtree(
+                        child_cell,
+                        child_idx,
+                        &mut child_hermite,
+                    );
+                    self.octree.cells[index][i] = new_cell;
+                    hermite_child[i] = child_hermite;
+                }
+                Cell::Leaf(..) => {
+                    hermite_child[i] = self.hermite_cells[index][i];
+                }
+                Cell::Full | Cell::Empty => {
+                    // Default-constructed hermite: no intersections, no
+                    // face QEF contributions, `qef_err = QEF_ERR_EMPTY`.
+                    // That's exactly how `merge` expects empty / full
+                    // children to present.
+                }
+                Cell::Invalid => {
+                    panic!(
+                        "collapse_subtree: Cell::Invalid at \
+                         cells[{index}][{i}] — flush must run first"
+                    )
+                }
+            }
+        }
+
+        // `cells[index]` now contains this row's post-collapse state
+        // (every Cell::Branch has been replaced with its collapsed
+        // Leaf/Full/Empty result; Cell::Leaf/Full/Empty entries are
+        // unchanged).  Save it before calling `check_done`, because
+        // `check_done` resets `cells[index]` to `[Cell::Invalid; 8]`
+        // or truncates whenever it decides to collapse (`out !=
+        // Branch`).  That reset is harmless in pre-Z1 scalar DFS —
+        // the not-at-tail reset branch never fires, because scalar
+        // DFS only collapses when all 8 children are leaf-ish and
+        // therefore no descendant rows exist past this one — but it
+        // IS fatal here.  `collapse_subtree` is a bottom-up pass
+        // over a fully-built subtree, so sibling branches that
+        // didn't collapse keep their rows alive, meaning our own
+        // row is usually NOT at the tail and `check_done` takes the
+        // write-`[Invalid; 8]` branch.  Those Invalid rows then
+        // escape the worker's octree and crash the MT-merge
+        // `remap_cell` pass, which walks every row linearly and
+        // panics on any `Cell::Invalid` it sees.
+        //
+        // The row is orphan after we return (the caller overwrites
+        // its parent's slot with `out`, which is non-Branch), so
+        // restoring the saved content doesn't affect tree
+        // traversal — it just keeps linear walks from blowing up.
+        let saved_row = self.octree.cells[index];
+        let out = self.octree.check_done(cell, index, hermite_child, hermite_out);
+        if !matches!(out, Cell::Branch { .. }) {
+            // `check_done` may have truncated; grow back if so.
+            if self.octree.cells.len() <= index {
+                self.octree
+                    .cells
+                    .resize(index + 1, [Cell::Invalid; 8]);
+            }
+            self.octree.cells[index] = saved_row;
+        }
+        out
     }
 
     /// Evaluates the given leaf
@@ -822,6 +1160,40 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                 }
                 qef.add_intersection(pos, grad);
 
+                // Morphé multi-gradient extension: if a features_at hook is
+                // installed on the builder (from Settings.features_at), ask
+                // it for the full list of outward face normals meeting at
+                // this intersection and stack each one into the QEF as an
+                // additional plane constraint.  At a flat interior hit the
+                // hook returns a single normal matching `grad`, which gets
+                // added as a (harmless) redundant plane; at a sharp crease
+                // it returns both face normals and the QEF solver snaps to
+                // the edge exactly; at a corner it returns all incident
+                // face normals and the solver snaps to the corner.
+                //
+                // The single Hermite intersection record below is left
+                // unchanged — it stores the primary gradient only, which
+                // is what the bottom-up collapse pass keys on.  Extra
+                // normals only affect the local QEF solve, never the
+                // merge/collapse heuristic.
+                if let Some(features_at) = self.features_at.as_ref() {
+                    let bounds = &cell.bounds.bounds;
+                    let cell_extent = [
+                        bounds[0].upper() - bounds[0].lower(),
+                        bounds[1].upper() - bounds[1].lower(),
+                        bounds[2].upper() - bounds[2].lower(),
+                    ];
+                    let pos_arr = [pos.x, pos.y, pos.z];
+                    for plane in features_at(pos_arr, cell_extent) {
+                        let extra = nalgebra::Vector4::new(
+                            plane[0], plane[1], plane[2], plane[3],
+                        );
+                        if !extra.iter().any(|f| f.is_nan()) {
+                            qef.add_intersection(pos, extra);
+                        }
+                    }
+                }
+
                 // Record this intersection in the Hermite data for the leaf
                 let edge_index = e.to_undirected().index();
                 hermite_cell.intersections[edge_index] = LeafIntersection {
@@ -835,7 +1207,13 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
             if let Some(pos) = force_point {
                 verts.push(CellVertex { pos });
             } else {
-                let (pos, err) = qef.solve();
+                // Scale the mass-point acceptance threshold to this cell.
+                let bounds = &cell.bounds.bounds;
+                let cell_extent_scalar =
+                    (bounds[0].upper() - bounds[0].lower())
+                        .max(bounds[1].upper() - bounds[1].lower())
+                        .max(bounds[2].upper() - bounds[2].lower());
+                let (pos, err) = qef.solve(cell_extent_scalar);
                 verts.push(pos);
 
                 // We overwrite the error here, because it's only used when
@@ -854,6 +1232,384 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
         );
 
         Cell::Leaf(Leaf { mask, index })
+    }
+
+    /// Z1: processes all queued leaves in a single pipelined pass.
+    ///
+    /// For each queued cell this function mirrors the work that the scalar
+    /// `leaf()` would have done, but collects the 8-corner sample, the 4×N
+    /// edge-search samples, and the N gradient samples from *every* queued
+    /// leaf into three flat evaluator calls — one big corner batch, four big
+    /// edge-search batches, and one big gradient batch. Per-cell QEF solve
+    /// and final vertex write-back are then done in a scalar sweep at the
+    /// end.
+    ///
+    /// The caller is responsible for invoking this with `eval` = the same
+    /// simplified `RenderHandle` that was active when the cells were queued,
+    /// i.e. the one at the simplification boundary that opened the batching
+    /// window.
+    ///
+    /// Returns `false` if cancelled; `true` (and empties `deferred_leaves`)
+    /// otherwise.
+    #[must_use]
+    fn flush_deferred_leaves<T>(
+        &mut self,
+        eval: &mut RenderHandle<F, T>,
+        vars: &ShapeVars<f32>,
+        cancel: &CancelToken,
+    ) -> bool {
+        // Keep `hermite_cells` aligned with `octree.cells` BEFORE the early
+        // return, so the invariant "inside an active batching window,
+        // `hermite_cells.len() >= octree.cells.len()`" holds unconditionally
+        // once flush has been called — including when the window had no
+        // mixed-sign max-depth leaves (deferred_leaves empty).
+        if self.hermite_cells.len() < self.octree.cells.len() {
+            self.hermite_cells
+                .resize(self.octree.cells.len(), [LeafHermiteData::default(); 8]);
+        }
+        if self.deferred_leaves.is_empty() {
+            return true;
+        }
+        if cancel.is_cancelled() {
+            return false;
+        }
+
+        const EDGE_SEARCH_SIZE: usize = 16;
+        const EDGE_SEARCH_DEPTH: usize = 4;
+
+        let n = self.deferred_leaves.len();
+
+        // --- Phase 1: corner batch (8 samples per queued cell) --------------
+        let mut corner_xs: Vec<f32> = Vec::with_capacity(n * 8);
+        let mut corner_ys: Vec<f32> = Vec::with_capacity(n * 8);
+        let mut corner_zs: Vec<f32> = Vec::with_capacity(n * 8);
+        for dl in &self.deferred_leaves {
+            for i in Corner::<3>::iter() {
+                let [x, y, z] = dl.cell.corner(i);
+                corner_xs.push(x);
+                corner_ys.push(y);
+                corner_zs.push(z);
+            }
+        }
+        let corner_out = self
+            .eval_float_slice
+            .eval_v(
+                eval.f_tape(&mut self.tape_storage),
+                &corner_xs,
+                &corner_ys,
+                &corner_zs,
+                vars,
+            )
+            .unwrap();
+
+        // Decide per-cell: empty / full (resolved now) vs. needs edge search.
+        // `masks[i] = Some(m)` means cell `i` has mixed signs and will go
+        // through edge search; `None` means it was resolved immediately.
+        let mut masks: Vec<Option<CellMask<3>>> = Vec::with_capacity(n);
+        for (i, dl) in self.deferred_leaves.iter().enumerate() {
+            let corner_vals = &corner_out[i * 8..(i + 1) * 8];
+            let mask_bits = corner_vals
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v < 0.0)
+                .fold(0u8, |acc, (i, _)| acc | (1 << i));
+            if mask_bits == 0 {
+                self.octree[dl.cell] = Cell::Empty;
+                masks.push(None);
+            } else if mask_bits == 255 {
+                self.octree[dl.cell] = Cell::Full;
+                masks.push(None);
+            } else {
+                masks.push(Some(CellMask::new(mask_bits)));
+            }
+        }
+
+        // --- Phase 2: build the flat edge list across all surviving cells ---
+        // For every surviving cell, for every vertex `vs` in its topology,
+        // for every edge `e` in that vertex, push one `EdgeSlot` into `edges`.
+        // `per_cell_edge_bases[i]` = first-edge-index for surviving cell `i`;
+        // a sentinel trailing entry makes `bases[i+1] - bases[i]` give the
+        // per-cell edge count without special-casing the last cell.
+        struct EdgeSlot {
+            /// Index into `self.deferred_leaves` / `masks`
+            cell_idx: usize,
+            start: nalgebra::Vector3<u16>,
+            end: nalgebra::Vector3<u16>,
+        }
+        let mut edges: Vec<EdgeSlot> = Vec::new();
+        let mut per_cell_edge_bases: Vec<usize> = Vec::with_capacity(n + 1);
+        for (i, mask_opt) in masks.iter().enumerate() {
+            per_cell_edge_bases.push(edges.len());
+            let Some(mask) = mask_opt else { continue };
+            for vs in CELL_TO_VERT_TO_EDGES[mask.index()].iter() {
+                for e in *vs {
+                    let axis = e.start().index() ^ e.end().index();
+                    debug_assert_eq!(axis.count_ones(), 1);
+                    debug_assert!(axis < 8);
+
+                    let (a, b) = if e.end().index() & axis != 0 {
+                        (0u16, u16::MAX)
+                    } else {
+                        (u16::MAX, 0u16)
+                    };
+
+                    let mut v = nalgebra::Vector3::zeros();
+                    let ui = (axis.trailing_zeros() + 1) % 3;
+                    let vi = (axis.trailing_zeros() + 2) % 3;
+                    v[ui as usize] = if e.start() & Axis::new(1 << ui) {
+                        u16::MAX
+                    } else {
+                        0
+                    };
+                    v[vi as usize] = if e.start() & Axis::new(1 << vi) {
+                        u16::MAX
+                    } else {
+                        0
+                    };
+
+                    let mut s = v;
+                    s[axis.trailing_zeros() as usize] = a;
+                    let mut ee = v;
+                    ee[axis.trailing_zeros() as usize] = b;
+
+                    edges.push(EdgeSlot {
+                        cell_idx: i,
+                        start: s,
+                        end: ee,
+                    });
+                }
+            }
+        }
+        per_cell_edge_bases.push(edges.len());
+
+        if edges.is_empty() {
+            // All queued cells were fully empty/full — nothing more to do.
+            self.deferred_leaves.clear();
+            return true;
+        }
+
+        let total_edges = edges.len();
+
+        // --- Phase 3: 4-iteration N-ary edge search, batched ---------------
+        let mut search_xs: Vec<f32> = vec![0.0; total_edges * EDGE_SEARCH_SIZE];
+        let mut search_ys: Vec<f32> = vec![0.0; total_edges * EDGE_SEARCH_SIZE];
+        let mut search_zs: Vec<f32> = vec![0.0; total_edges * EDGE_SEARCH_SIZE];
+
+        for _ in 0..EDGE_SEARCH_DEPTH {
+            for (ei, edge) in edges.iter().enumerate() {
+                let cell = self.deferred_leaves[edge.cell_idx].cell;
+                for j in 0..EDGE_SEARCH_SIZE {
+                    let pos = ((edge.start.map(|i| i as u32)
+                        * (EDGE_SEARCH_SIZE - j - 1) as u32)
+                        + (edge.end.map(|i| i as u32) * j as u32))
+                        / ((EDGE_SEARCH_SIZE - 1) as u32);
+                    debug_assert!(pos.max() <= u16::MAX.into());
+                    let pos_f = cell.pos(pos.map(|p| p as u16));
+                    let idx = ei * EDGE_SEARCH_SIZE + j;
+                    search_xs[idx] = pos_f.x;
+                    search_ys[idx] = pos_f.y;
+                    search_zs[idx] = pos_f.z;
+                }
+            }
+
+            let out = self
+                .eval_float_slice
+                .eval_v(
+                    eval.f_tape(&mut self.tape_storage),
+                    &search_xs,
+                    &search_ys,
+                    &search_zs,
+                    vars,
+                )
+                .unwrap();
+
+            for (ei, edge) in edges.iter_mut().enumerate() {
+                let search = &out[ei * EDGE_SEARCH_SIZE
+                    ..(ei + 1) * EDGE_SEARCH_SIZE];
+                debug_assert!(search[0] < 0.0);
+                debug_assert!(search[EDGE_SEARCH_SIZE - 1] >= 0.0);
+                let frac = search
+                    .iter()
+                    .enumerate()
+                    .find(|(_, v)| **v >= 0.0)
+                    .unwrap()
+                    .0;
+                debug_assert!(frac > 0);
+                debug_assert!(frac < EDGE_SEARCH_SIZE);
+
+                let f = |frac| {
+                    ((edge.start.map(|i| i as u32)
+                        * (EDGE_SEARCH_SIZE - frac - 1) as u32)
+                        + (edge.end.map(|i| i as u32) * frac as u32))
+                        / ((EDGE_SEARCH_SIZE - 1) as u32)
+                };
+
+                let a = f(frac - 1);
+                let b = f(frac);
+                debug_assert!(a.max() <= u16::MAX.into());
+                debug_assert!(b.max() <= u16::MAX.into());
+                edge.start = a.map(|v| v as u16);
+                edge.end = b.map(|v| v as u16);
+            }
+        }
+
+        // --- Phase 4: one big gradient batch at the final intersection ------
+        let mut grad_xs: Vec<Grad> = Vec::with_capacity(total_edges);
+        let mut grad_ys: Vec<Grad> = Vec::with_capacity(total_edges);
+        let mut grad_zs: Vec<Grad> = Vec::with_capacity(total_edges);
+        for edge in &edges {
+            let cell = self.deferred_leaves[edge.cell_idx].cell;
+            let xyz = ((edge.start.map(|v| v as u32)
+                + edge.end.map(|v| v as u32))
+                / 2)
+            .map(|v| v as u16);
+            let pos = cell.pos(xyz);
+            grad_xs.push(Grad::new(pos.x, 1.0, 0.0, 0.0));
+            grad_ys.push(Grad::new(pos.y, 0.0, 1.0, 0.0));
+            grad_zs.push(Grad::new(pos.z, 0.0, 0.0, 1.0));
+        }
+        let grads = self
+            .eval_grad_slice
+            .eval_v(
+                eval.g_tape(&mut self.tape_storage),
+                &grad_xs,
+                &grad_ys,
+                &grad_zs,
+                vars,
+            )
+            .unwrap();
+
+        // --- Phase 5: per-cell QEF solve + Cell::Leaf write-back -----------
+        // Mirrors the cursor-advancement semantics of the scalar `leaf()`
+        // including the NaN-break behaviour (cursor is only incremented on
+        // successful non-NaN add).
+        //
+        // Also populates `self.hermite_cells[parent_idx][corner_idx]` with
+        // per-edge intersections + QEF error, so the post-flush
+        // `collapse_subtree` pass can run `try_collapse` bottom-up over this
+        // subtree exactly the way scalar MDC would.  Without this, every
+        // surface-crossing cell survives as its own leaf and the mesh comes
+        // out at uniform max-depth density.
+        for (i, mask_opt) in masks.iter().enumerate() {
+            let Some(mask) = mask_opt else { continue };
+            let dl = &self.deferred_leaves[i];
+            let base = per_cell_edge_bases[i];
+            let n_edges = per_cell_edge_bases[i + 1] - base;
+
+            // Per-leaf hermite data we're about to fill in.  Starts blank.
+            let mut hermite_cell = LeafHermiteData::default();
+
+            let mut verts: arrayvec::ArrayVec<CellVertex<3>, 4> =
+                arrayvec::ArrayVec::new();
+            let mut cursor = 0usize;
+            for vs in CELL_TO_VERT_TO_EDGES[mask.index()].iter() {
+                let mut force_point: Option<nalgebra::Vector3<f32>> = None;
+                let mut qef = QuadraticErrorSolver::new();
+                for e in vs.iter() {
+                    let global = base + cursor;
+                    let pos = nalgebra::Vector3::new(
+                        grad_xs[global].v,
+                        grad_ys[global].v,
+                        grad_zs[global].v,
+                    );
+                    let grad: nalgebra::Vector4<f32> = grads[global].into();
+
+                    if grad.iter().any(|f| f.is_nan()) {
+                        // Match scalar leaf()'s NaN handling: force-point
+                        // the vertex and mark hermite as QEF_ERR_INVALID so
+                        // `merge` rejects this subtree for collapsing.
+                        force_point = Some(pos);
+                        hermite_cell.qef_err = QEF_ERR_INVALID;
+                        break;
+                    }
+                    qef.add_intersection(pos, grad);
+
+                    // Morphé multi-gradient extension — same logic as the
+                    // scalar leaf() path, but operating on this cell's
+                    // DeferredLeaf record.  See the sibling edit in leaf()
+                    // for the rationale.
+                    if let Some(features_at) = self.features_at.as_ref() {
+                        let bounds = &dl.cell.bounds.bounds;
+                        let cell_extent = [
+                            bounds[0].upper() - bounds[0].lower(),
+                            bounds[1].upper() - bounds[1].lower(),
+                            bounds[2].upper() - bounds[2].lower(),
+                        ];
+                        let pos_arr = [pos.x, pos.y, pos.z];
+                        for plane in features_at(pos_arr, cell_extent) {
+                            let extra = nalgebra::Vector4::new(
+                                plane[0], plane[1], plane[2], plane[3],
+                            );
+                            if !extra.iter().any(|f| f.is_nan()) {
+                                qef.add_intersection(pos, extra);
+                            }
+                        }
+                    }
+
+                    // Record this intersection in the leaf's hermite data,
+                    // using the same edge-index convention scalar leaf()
+                    // uses (`e.to_undirected().index()`).
+                    let edge_index = e.to_undirected().index();
+                    hermite_cell.intersections[edge_index] =
+                        LeafIntersection {
+                            pos: nalgebra::Vector4::new(
+                                pos.x, pos.y, pos.z, 1.0,
+                            ),
+                            grad,
+                        };
+
+                    cursor += 1;
+                }
+
+                if let Some(pos) = force_point {
+                    verts.push(CellVertex { pos });
+                } else {
+                    // Scale the mass-point acceptance threshold to this
+                    // deferred leaf's cell, mirroring the scalar leaf().
+                    let bounds = &dl.cell.bounds.bounds;
+                    let cell_extent_scalar =
+                        (bounds[0].upper() - bounds[0].lower())
+                            .max(bounds[1].upper() - bounds[1].lower())
+                            .max(bounds[2].upper() - bounds[2].lower());
+                    let (pos, err) = qef.solve(cell_extent_scalar);
+                    verts.push(pos);
+                    // Last-error-wins, matching scalar leaf() — only
+                    // meaningful when the mask has a single vertex (the
+                    // only case where try_collapse actually looks at it).
+                    hermite_cell.qef_err = err;
+                }
+            }
+
+            let vert_index = self.octree.verts.len();
+            self.octree.verts.extend(verts);
+            // Append the per-edge intersection positions — these serve as the
+            // edge vertices that `walk_dual` emits on boundary edges, and
+            // must match the order of the intersections produced inside the
+            // scalar `leaf()`.
+            for ei_in_cell in 0..n_edges {
+                let global = base + ei_in_cell;
+                let pos = nalgebra::Vector3::new(
+                    grad_xs[global].v,
+                    grad_ys[global].v,
+                    grad_zs[global].v,
+                );
+                self.octree.verts.push(CellVertex { pos });
+            }
+
+            self.octree[dl.cell] = Cell::Leaf(Leaf {
+                mask: *mask,
+                index: vert_index,
+            });
+
+            // Publish hermite to the parent's slot so collapse_subtree can
+            // read it.  `hermite_cells` is grown in lock-step with
+            // `octree.cells`, so this index is always in bounds.
+            self.hermite_cells[dl.parent_idx][dl.corner_idx as usize] =
+                hermite_cell;
+        }
+
+        self.deferred_leaves.clear();
+        true
     }
 }
 
@@ -1015,8 +1771,13 @@ impl LeafHermiteData {
         Some(out)
     }
 
-    /// Solves the combined QEF
-    pub fn solve(&self) -> (CellVertex<3>, f32) {
+    /// Solves the combined QEF.
+    ///
+    /// `cell_extent` is the largest axis-aligned extent of the parent cell
+    /// whose children's Hermite data have been merged here; passed straight
+    /// through to `QuadraticErrorSolver::solve` for the mass-point
+    /// acceptance test.
+    pub fn solve(&self, cell_extent: f32) -> (CellVertex<3>, f32) {
         let mut qef = self.center_qef;
         for &i in &self.intersections {
             qef += i.into();
@@ -1024,7 +1785,7 @@ impl LeafHermiteData {
         for &f in &self.face_qefs {
             qef += f;
         }
-        qef.solve()
+        qef.solve(cell_extent)
     }
 }
 

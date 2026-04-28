@@ -60,18 +60,11 @@ impl QuadraticErrorSolver {
 
     /// Solve the given QEF, minimizing towards the mass point
     ///
-    /// `cell_extent` is the largest axis-aligned extent of the cell this QEF
-    /// belongs to (in world units).  It is used by the mass-point acceptance
-    /// test described below to distinguish "vertex snapped to a genuine sharp
-    /// feature" from "QEF drove the vertex out to infinity because the
-    /// gradient field lied".  Pass `1.0` if the caller has no meaningful
-    /// notion of cell size (e.g. synthetic unit tests).
-    ///
     /// Returns a vertex localized within the given cell, and adjusts the solver
     /// to increase the likelihood that the vertex is bounded in the cell.
     ///
     /// Also returns the QEF error as the second item in the tuple
-    pub fn solve(&self, cell_extent: f32) -> (CellVertex<3>, f32) {
+    pub fn solve(&self) -> (CellVertex<3>, f32) {
         // This gets a little tricky; see
         // https://www.mattkeeter.com/projects/qef for a walkthrough of QEF math
         // and references to primary sources.
@@ -121,63 +114,6 @@ impl QuadraticErrorSolver {
             + self.btb)
             .max(1e-6);
 
-        // --- Mass-point acceptance test (Morphé) ------------------------
-        // DC/MDC's QEF solver assumes the gradient field is locally
-        // Lipschitz-continuous inside a cell: every sampled normal is a
-        // reasonable linear approximation of the surface in that cell, and
-        // the planes they define intersect near the surface.  Mesh-derived
-        // SDFs (and unions/intersections of them) routinely violate this at
-        // the medial axis, where the closest-feature swaps between two
-        // disparate triangles within a single cell.  The gradients that
-        // result point in nearly opposite directions; the QEF then has no
-        // well-conditioned intersection and can solve to a vertex tens or
-        // hundreds of cell-widths outside the cell, producing the "spike"
-        // triangles and overlapping sheets we observe on mesh-derived
-        // inputs near sharp edges.
-        //
-        // libfive handles this with a mass-point acceptance test: compare
-        // the solved position to the centroid of the gradient-sample
-        // positions and the residual error to a per-plane spread measure;
-        // if either is larger than a scale-relative threshold, fall back to
-        // the centroid, which is always well-defined and always inside the
-        // convex hull of the samples (and hence inside the cell for a
-        // convex cell).  The thresholds are expressed in units of the
-        // cell's own extent so they rescale automatically when the mesher
-        // subdivides — no per-scene tuning.
-        //
-        // `MASS_POINT_DEVIATION` is allowed to be ≥ 1.0 because a genuine
-        // sharp-feature snap can land a vertex near the cell boundary
-        // opposite the intersection samples.  We only reject solutions
-        // that have escaped the cell by a large multiple of its extent.
-        //
-        // `PER_PLANE_ERROR` caps the mean squared distance from the solved
-        // position to each constraint plane.  For well-conditioned cells
-        // on genuine surfaces this is ~1e-6 (the floor).  For medial-axis
-        // cells with contradictory normals, residual scales as the plane
-        // disagreement times the inter-plane separation squared, and
-        // quickly exceeds a fraction of cell_extent².
-        const MASS_POINT_DEVIATION: f32 = 1.0;
-        const PER_PLANE_ERROR: f32 = 0.25;
-        let count = self.mass_point.w;
-        if cell_extent > 0.0 && count > 0.0 {
-            let deviation = (pos - center).norm();
-            let per_plane_err = err / count;
-            let dev_limit = MASS_POINT_DEVIATION * cell_extent;
-            let err_limit =
-                PER_PLANE_ERROR * cell_extent * cell_extent;
-            if deviation > dev_limit || per_plane_err > err_limit {
-                // Fall back to the mass-point centroid and recompute err
-                // at that position so downstream consumers (cell-collapse
-                // heuristic) see consistent (pos, err) data.
-                let pos = center;
-                let err = ((pos.transpose() * self.ata * pos
-                    - 2.0 * pos.transpose() * self.atb)[0]
-                    + self.btb)
-                    .max(1e-6);
-                return (CellVertex { pos }, err);
-            }
-        }
-
         (CellVertex { pos }, err)
     }
 }
@@ -202,7 +138,7 @@ mod test {
             Vector3::new(-0.50, -1.0, -0.6),
             Vector4::new(0.0, 0.0, 0.31, 0.0),
         );
-        let (_out, err) = q.solve(1.0);
+        let (_out, err) = q.solve();
         assert_eq!(err, 1e-6);
     }
 
@@ -221,7 +157,7 @@ mod test {
             Vector3::new(-0.5, -0.25, 0.50),
             Vector4::new(-0.6666667, -0.33333334, 0.6666667, 0.0),
         );
-        let (out, err) = q.solve(1.0);
+        let (out, err) = q.solve();
         assert_eq!(err, 1e-6);
         let expected = Vector3::new(-0.5, -0.25, 0.5);
         assert!(

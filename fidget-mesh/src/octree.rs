@@ -95,16 +95,10 @@ impl Octree {
                 settings.depth,
                 &settings.cancel,
                 threads,
-                settings.features_at.as_ref(),
             )
         } else {
             let mut eval = RenderHandle::new(shape.clone());
             let mut out = OctreeBuilder::new();
-            // Propagate the Morphé multi-gradient QEF hook (if installed)
-            // from `Settings` onto the builder, so the single-threaded
-            // vertex-placement path in `leaf` / `flush_deferred_leaves`
-            // can see it.  Cloning `Option<Arc<dyn Fn>>` is an Arc bump.
-            out.features_at = settings.features_at.clone();
             let mut hermite = LeafHermiteData::default();
             if !out.recurse(
                 &mut eval,
@@ -139,7 +133,6 @@ impl Octree {
         max_depth: u8,
         cancel: &CancelToken,
         threads: &ThreadPool,
-        features_at: Option<&crate::FeaturesFn>,
     ) -> Option<Self> {
         let mut root = Octree::new();
         let mut todo = VecDeque::new();
@@ -179,13 +172,7 @@ impl Octree {
             todo.par_iter()
                 .map_init(
                     || {
-                        let mut builder = OctreeBuilder::new();
-                        // Share the Morphé multi-gradient QEF hook (if
-                        // installed) with every rayon worker.  Each worker
-                        // gets its own Arc handle; the underlying closure
-                        // must be `Send + Sync`, which `FeaturesFn`
-                        // guarantees at the type level.
-                        builder.features_at = features_at.cloned();
+                        let builder = OctreeBuilder::new();
                         (builder, rh.clone())
                     },
                     |(builder, eval), cell| {
@@ -399,14 +386,7 @@ impl Octree {
         //   have been collapsed into a single empty / full cell
         // - The interior vertices *do not* match, in which case the
         //   cell should not be marked as collapsible.
-        // Scale the mass-point acceptance threshold to this merged cell's
-        // extent — for collapse the relevant cell is the parent, whose
-        // bounds are `cell.bounds`.
-        let bounds = &cell.bounds.bounds;
-        let cell_extent_scalar = (bounds[0].upper() - bounds[0].lower())
-            .max(bounds[1].upper() - bounds[1].lower())
-            .max(bounds[2].upper() - bounds[2].lower());
-        let (pos, new_err) = hermite.solve(cell_extent_scalar);
+        let (pos, new_err) = hermite.solve();
         if new_err >= hermite.qef_err * 2.0 || !cell.bounds.contains(pos) {
             return None;
         }
@@ -559,12 +539,13 @@ struct DeferredLeaf {
 
 /// Data structure for an under-construction octree
 //
-// Note: cannot `#[derive(Debug)]` because `features_at: Option<FeaturesFn>`
-// holds a `dyn Fn(...)` trait object, and `Fn` trait objects don't implement
-// `Debug`.  The manual impl below mirrors what the derive would have produced
-// for the other fields and replaces the closure with a `<closure>` placeholder
-// so the struct can still participate in tracing / `{:?}` debug prints
-// wherever callers reach for them.
+// Note: cannot `#[derive(Debug)]` because the `ShapeBulkEval<F::*>` and
+// `ShapeTracingEval<F::*>` evaluator fields are generic over `F`'s
+// associated types, which don't carry `Debug` bounds — `#[derive(Debug)]`
+// would silently propagate `where F::FloatSliceEval: Debug` (etc.) clauses
+// to every caller.  The manual impl below skips those fields via
+// `finish_non_exhaustive` so the struct can still participate in tracing /
+// `{:?}` debug prints wherever callers reach for them.
 pub(crate) struct OctreeBuilder<F: Function + RenderHints> {
     /// In-construction octree
     pub(crate) octree: Octree,
@@ -611,19 +592,6 @@ pub(crate) struct OctreeBuilder<F: Function + RenderHints> {
     /// pass will read.  Entries outside an active batching window are
     /// meaningless and should not be read.
     hermite_cells: Vec<[LeafHermiteData; 8]>,
-
-    /// Optional hook supplying additional QEF plane constraints at each edge
-    /// zero-crossing in the leaf vertex-placement routine.
-    ///
-    /// Mirrors [`crate::Settings::features_at`] — populated from it when the
-    /// builder is instantiated for a given build.  `None` preserves the
-    /// upstream single-normal QEF behaviour; `Some(...)` enables the
-    /// multi-gradient extension used by Morphé's FCPW mesh-SDF oracle so the
-    /// QEF can snap to sharp creases and corners.
-    ///
-    /// The closure is `Arc`-wrapped so it can be cheaply shared across rayon
-    /// workers (one `Arc::clone` per worker during `build_inner_mt`).
-    pub(crate) features_at: Option<crate::FeaturesFn>,
 }
 
 impl<F: Function + RenderHints> std::fmt::Debug for OctreeBuilder<F> {
@@ -645,10 +613,6 @@ impl<F: Function + RenderHints> std::fmt::Debug for OctreeBuilder<F> {
             .field("octree", &self.octree)
             .field("deferred_leaves_len", &self.deferred_leaves.len())
             .field("hermite_cells_len", &self.hermite_cells.len())
-            .field(
-                "features_at",
-                &self.features_at.as_ref().map(|_| "<closure>"),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -672,7 +636,6 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
             workspace: Default::default(),
             deferred_leaves: vec![],
             hermite_cells: vec![],
-            features_at: None,
         }
     }
 
@@ -1160,40 +1123,6 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                 }
                 qef.add_intersection(pos, grad);
 
-                // Morphé multi-gradient extension: if a features_at hook is
-                // installed on the builder (from Settings.features_at), ask
-                // it for the full list of outward face normals meeting at
-                // this intersection and stack each one into the QEF as an
-                // additional plane constraint.  At a flat interior hit the
-                // hook returns a single normal matching `grad`, which gets
-                // added as a (harmless) redundant plane; at a sharp crease
-                // it returns both face normals and the QEF solver snaps to
-                // the edge exactly; at a corner it returns all incident
-                // face normals and the solver snaps to the corner.
-                //
-                // The single Hermite intersection record below is left
-                // unchanged — it stores the primary gradient only, which
-                // is what the bottom-up collapse pass keys on.  Extra
-                // normals only affect the local QEF solve, never the
-                // merge/collapse heuristic.
-                if let Some(features_at) = self.features_at.as_ref() {
-                    let bounds = &cell.bounds.bounds;
-                    let cell_extent = [
-                        bounds[0].upper() - bounds[0].lower(),
-                        bounds[1].upper() - bounds[1].lower(),
-                        bounds[2].upper() - bounds[2].lower(),
-                    ];
-                    let pos_arr = [pos.x, pos.y, pos.z];
-                    for plane in features_at(pos_arr, cell_extent) {
-                        let extra = nalgebra::Vector4::new(
-                            plane[0], plane[1], plane[2], plane[3],
-                        );
-                        if !extra.iter().any(|f| f.is_nan()) {
-                            qef.add_intersection(pos, extra);
-                        }
-                    }
-                }
-
                 // Record this intersection in the Hermite data for the leaf
                 let edge_index = e.to_undirected().index();
                 hermite_cell.intersections[edge_index] = LeafIntersection {
@@ -1207,13 +1136,7 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
             if let Some(pos) = force_point {
                 verts.push(CellVertex { pos });
             } else {
-                // Scale the mass-point acceptance threshold to this cell.
-                let bounds = &cell.bounds.bounds;
-                let cell_extent_scalar =
-                    (bounds[0].upper() - bounds[0].lower())
-                        .max(bounds[1].upper() - bounds[1].lower())
-                        .max(bounds[2].upper() - bounds[2].lower());
-                let (pos, err) = qef.solve(cell_extent_scalar);
+                let (pos, err) = qef.solve();
                 verts.push(pos);
 
                 // We overwrite the error here, because it's only used when
@@ -1524,28 +1447,6 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                     }
                     qef.add_intersection(pos, grad);
 
-                    // Morphé multi-gradient extension — same logic as the
-                    // scalar leaf() path, but operating on this cell's
-                    // DeferredLeaf record.  See the sibling edit in leaf()
-                    // for the rationale.
-                    if let Some(features_at) = self.features_at.as_ref() {
-                        let bounds = &dl.cell.bounds.bounds;
-                        let cell_extent = [
-                            bounds[0].upper() - bounds[0].lower(),
-                            bounds[1].upper() - bounds[1].lower(),
-                            bounds[2].upper() - bounds[2].lower(),
-                        ];
-                        let pos_arr = [pos.x, pos.y, pos.z];
-                        for plane in features_at(pos_arr, cell_extent) {
-                            let extra = nalgebra::Vector4::new(
-                                plane[0], plane[1], plane[2], plane[3],
-                            );
-                            if !extra.iter().any(|f| f.is_nan()) {
-                                qef.add_intersection(pos, extra);
-                            }
-                        }
-                    }
-
                     // Record this intersection in the leaf's hermite data,
                     // using the same edge-index convention scalar leaf()
                     // uses (`e.to_undirected().index()`).
@@ -1564,14 +1465,7 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                 if let Some(pos) = force_point {
                     verts.push(CellVertex { pos });
                 } else {
-                    // Scale the mass-point acceptance threshold to this
-                    // deferred leaf's cell, mirroring the scalar leaf().
-                    let bounds = &dl.cell.bounds.bounds;
-                    let cell_extent_scalar =
-                        (bounds[0].upper() - bounds[0].lower())
-                            .max(bounds[1].upper() - bounds[1].lower())
-                            .max(bounds[2].upper() - bounds[2].lower());
-                    let (pos, err) = qef.solve(cell_extent_scalar);
+                    let (pos, err) = qef.solve();
                     verts.push(pos);
                     // Last-error-wins, matching scalar leaf() — only
                     // meaningful when the mask has a single vertex (the
@@ -1772,12 +1666,7 @@ impl LeafHermiteData {
     }
 
     /// Solves the combined QEF.
-    ///
-    /// `cell_extent` is the largest axis-aligned extent of the parent cell
-    /// whose children's Hermite data have been merged here; passed straight
-    /// through to `QuadraticErrorSolver::solve` for the mass-point
-    /// acceptance test.
-    pub fn solve(&self, cell_extent: f32) -> (CellVertex<3>, f32) {
+    pub fn solve(&self) -> (CellVertex<3>, f32) {
         let mut qef = self.center_qef;
         for &i in &self.intersections {
             qef += i.into();
@@ -1785,7 +1674,7 @@ impl LeafHermiteData {
         for &f in &self.face_qefs {
             qef += f;
         }
-        qef.solve(cell_extent)
+        qef.solve()
     }
 }
 

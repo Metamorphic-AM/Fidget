@@ -1046,13 +1046,21 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                 // The search must be inside-to-outside
                 debug_assert!(search[0] < 0.0);
                 debug_assert!(search[EDGE_SEARCH_SIZE - 1] >= 0.0);
-                let frac = search
+
+                // Safe guards: `find` returning None (FMA ULP flip at the
+                // boundary) or frac==0 (start already outside) both skip
+                // refinement for this iteration — same logic as
+                // flush_deferred_leaves Phase 3.
+                let Some((frac, _)) = search
                     .iter()
                     .enumerate()
                     .find(|(_i, v)| **v >= 0.0)
-                    .unwrap()
-                    .0;
-                debug_assert!(frac > 0);
+                else {
+                    continue;
+                };
+                if frac == 0 {
+                    continue;
+                }
                 debug_assert!(frac < EDGE_SEARCH_SIZE);
 
                 let f = |frac| {
@@ -1351,13 +1359,35 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                     ..(ei + 1) * EDGE_SEARCH_SIZE];
                 debug_assert!(search[0] < 0.0);
                 debug_assert!(search[EDGE_SEARCH_SIZE - 1] >= 0.0);
-                let frac = search
+
+                // Guard 1: find the first outside (non-negative) sample.
+                //
+                // `find` returns `None` when `search[EDGE_SEARCH_SIZE-1]`
+                // evaluates as negative in this iteration even though it was
+                // positive in the Phase-1 corner eval.  This can happen due
+                // to SIMD FMA rounding: the same f32 position yields an
+                // opposite-sign ULP result when it lands in a different AVX
+                // lane across iterations.  Skipping the update for this edge
+                // (leaving start/end unchanged) is safe — Phase 4 will still
+                // evaluate the gradient at the current midpoint, and
+                // subsequent search iterations may resolve the crossing.
+                let Some((frac, _)) = search
                     .iter()
                     .enumerate()
                     .find(|(_, v)| **v >= 0.0)
-                    .unwrap()
-                    .0;
-                debug_assert!(frac > 0);
+                else {
+                    continue;
+                };
+
+                // Guard 2: frac == 0 means search[0] >= 0, i.e. the edge
+                // start is already outside — orientation is backwards or the
+                // crossing is before the current window.  Attempting
+                // `f(frac - 1)` with frac=0 would underflow to usize::MAX
+                // (silently in release builds), producing garbage coordinates.
+                // Skip the update so the window stays stable.
+                if frac == 0 {
+                    continue;
+                }
                 debug_assert!(frac < EDGE_SEARCH_SIZE);
 
                 let f = |frac| {

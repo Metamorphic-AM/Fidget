@@ -41,6 +41,30 @@ pub struct Leaf<const D: usize> {
 
     /// Index of first vertex in [`Octree::verts`](super::octree::Octree::verts)
     pub index: usize,
+
+    /// Index into [`Octree::splits`](super::octree::Octree::splits) of this
+    /// leaf's edge-to-vertex map, or [`NO_SPLIT`] when every edge belongs to
+    /// the vertex of its sign component (the table-driven default).
+    pub split: u32,
+}
+
+/// Marker for a leaf without an edge-to-vertex map of its own
+pub const NO_SPLIT: u32 = u32::MAX;
+
+/// Marker in [`SplitMap::apex`] for an edge whose component has no crease
+/// apex
+pub const NO_APEX: u8 = u8::MAX;
+
+/// A split leaf's map from its 12 edges to vertices in its block of
+/// [`Octree::verts`](super::octree::Octree::verts)
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct SplitMap {
+    /// Offset of the vertex each edge belongs to
+    pub vert: [u8; 12],
+    /// Offset of the crease apex of each edge's component, or [`NO_APEX`]:
+    /// the crease or corner the component's sheets meet at, lying outside
+    /// the cell, which only the stitch polygons use
+    pub apex: [u8; 12],
 }
 
 impl<const D: usize> Leaf<D> {
@@ -236,6 +260,7 @@ mod test {
         let c = Cell::<3>::Leaf(Leaf {
             mask: CellMask::new(0b00000010),
             index: 0,
+            split: NO_SPLIT,
         });
         assert!(!c.corner(Corner::new(0)));
         assert!(c.corner(Corner::new(1)));

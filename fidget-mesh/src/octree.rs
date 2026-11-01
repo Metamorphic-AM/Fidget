@@ -3,19 +3,21 @@
 use super::{
     Mesh, Settings,
     builder::MeshBuilder,
-    cell::{Cell, CellIndex, CellVertex, Leaf},
+    cell::{Cell, CellBounds, CellIndex, CellVertex, Leaf, NO_APEX, NO_SPLIT, SplitMap},
     codegen::CELL_TO_VERT_TO_EDGES,
     frame::Frame,
     qef::QuadraticErrorSolver,
-    types::{Axis, CellMask, Corner, Edge},
+    types::{Axis, CellMask, Corner, DirectedEdge, Edge, Intersection, Offset},
 };
 use fidget_core::{
     eval::Function,
     render::{CancelToken, RenderHandle, RenderHints, ThreadPool},
     shape::{Shape, ShapeBulkEval, ShapeTracingEval, ShapeVars},
-    types::Grad,
+    types::{Grad, Interval},
 };
 use std::collections::VecDeque;
+use crate::stats::Placement;
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Octree storing occupancy and vertex positions for Manifold Dual Contouring
 #[derive(Debug)]
@@ -28,6 +30,23 @@ pub struct Octree {
     /// This is indexed by cell leaf index; the exact shape depends heavily on
     /// the number of intersections and vertices within each leaf.
     pub(crate) verts: Vec<CellVertex<3>>,
+
+    /// How `walk_dual` turns each dual polygon into triangles
+    pub(crate) triangulation: crate::Triangulation,
+
+    /// Whether `check_done` may merge eight leaves into one
+    pub(crate) collapse: bool,
+
+    /// Whether cell vertices are kept inside their cells
+    pub(crate) bounded: bool,
+
+    /// Rank of the solve that placed each entry of `verts` (0 for the
+    /// vertices on edges), so the dual walk can tell crease vertices apart
+    pub(crate) vert_rank: Vec<u8>,
+
+    /// Edge-to-vertex maps of the leaves that hold a vertex per sheet,
+    /// indexed by [`Leaf::split`]
+    pub(crate) splits: Vec<SplitMap>,
 }
 
 impl Octree {
@@ -37,6 +56,11 @@ impl Octree {
             root: Cell::Invalid,
             cells: vec![],
             verts: vec![],
+            triangulation: crate::Triangulation::default(),
+            collapse: true,
+            bounded: true,
+            vert_rank: vec![],
+            splits: vec![],
         }
     }
 
@@ -88,17 +112,21 @@ impl Octree {
         vars: &ShapeVars<f32>,
         settings: &Settings,
     ) -> Option<Self> {
-        if let Some(threads) = settings.threads {
+        let out = if let Some(threads) = settings.threads {
             Self::build_inner_mt(
                 shape,
                 vars,
                 settings.depth,
                 &settings.cancel,
                 threads,
+                settings.collapse,
+                settings.bounded,
             )
         } else {
             let mut eval = RenderHandle::new(shape.clone());
             let mut out = OctreeBuilder::new();
+            out.octree.collapse = settings.collapse;
+            out.octree.bounded = settings.bounded;
             let mut hermite = LeafHermiteData::default();
             if !out.recurse(
                 &mut eval,
@@ -123,7 +151,11 @@ impl Octree {
                 return None;
             }
             Some(out.octree)
-        }
+        };
+        out.map(|mut o| {
+            o.triangulation = settings.triangulation;
+            o
+        })
     }
 
     /// Multithreaded constructor
@@ -133,8 +165,12 @@ impl Octree {
         max_depth: u8,
         cancel: &CancelToken,
         threads: &ThreadPool,
+        collapse: bool,
+        bounded: bool,
     ) -> Option<Self> {
         let mut root = Octree::new();
+        root.collapse = collapse;
+        root.bounded = bounded;
         let mut todo = VecDeque::new();
         todo.push_back(CellIndex::<3>::default());
         let mut fixup = vec![];
@@ -172,7 +208,9 @@ impl Octree {
             todo.par_iter()
                 .map_init(
                     || {
-                        let builder = OctreeBuilder::new();
+                        let mut builder = OctreeBuilder::new();
+                        builder.octree.collapse = collapse;
+                        builder.octree.bounded = bounded;
                         (builder, rh.clone())
                     },
                     |(builder, eval), cell| {
@@ -200,10 +238,11 @@ impl Octree {
                         if !builder.flush_deferred_leaves(eval, vars, cancel) {
                             return None;
                         }
-                        let octree = std::mem::replace(
-                            &mut builder.octree,
-                            Octree::new(),
-                        );
+                        let mut fresh = Octree::new();
+                        fresh.collapse = collapse;
+                        fresh.bounded = bounded;
+                        let octree =
+                            std::mem::replace(&mut builder.octree, fresh);
                         Some(Output {
                             octree,
                             cell: *cell,
@@ -217,6 +256,7 @@ impl Octree {
         // Copy hermite data into arrays, and compute cumulative offsets
         let mut cell_offsets = vec![root.cells.len()];
         let mut vert_offsets = vec![0];
+        let mut split_offsets = vec![0u32];
         for o in &out {
             let (i, j) = o.cell.index.unwrap();
             hermites[i][j as usize] = o.hermite;
@@ -224,6 +264,8 @@ impl Octree {
             cell_offsets.push(c);
             let v = vert_offsets.last().unwrap() + o.octree.verts.len();
             vert_offsets.push(v);
+            let sp = split_offsets.last().unwrap() + o.octree.splits.len() as u32;
+            split_offsets.push(sp);
         }
         root.cells.reserve(*cell_offsets.last().unwrap());
         root.verts.reserve(*vert_offsets.last().unwrap());
@@ -232,9 +274,14 @@ impl Octree {
             assert_eq!(cell_offsets[i], root.cells.len());
             assert_eq!(vert_offsets[i], root.verts.len());
             let remap_cell = |c| match c {
-                Cell::Leaf(Leaf { mask, index }) => Cell::Leaf(Leaf {
+                Cell::Leaf(Leaf { mask, index, split }) => Cell::Leaf(Leaf {
                     mask,
                     index: index + vert_offsets[i],
+                    split: if split == NO_SPLIT {
+                        NO_SPLIT
+                    } else {
+                        split + split_offsets[i]
+                    },
                 }),
                 Cell::Branch { index } => Cell::Branch {
                     index: index + cell_offsets[i],
@@ -246,6 +293,8 @@ impl Octree {
                 o.octree.cells.into_iter().map(|cs| cs.map(remap_cell)),
             );
             root.verts.extend(o.octree.verts);
+            root.vert_rank.extend(o.octree.vert_rank);
+            root.splits.extend(o.octree.splits);
             root[o.cell] = remap_cell(o.octree.root);
         }
 
@@ -300,6 +349,26 @@ impl Octree {
         }
     }
 
+    /// The vertex on `edge` of `leaf` and the cell vertex that edge belongs to
+    pub(crate) fn leaf_edge(&self, leaf: &Leaf<3>, edge: Edge) -> Option<Intersection> {
+        let mut i = leaf.edge(edge)?;
+        if leaf.split != NO_SPLIT {
+            i.vert = Offset(self.splits[leaf.split as usize].vert[edge.index()]);
+        }
+        Some(i)
+    }
+
+    /// The crease apex of the component that `edge` of `leaf` belongs to,
+    /// as an index into `verts`, when the leaf was split by sheet and the
+    /// sheets meet at a feature within reach (see [`SplitMap::apex`])
+    pub(crate) fn leaf_apex(&self, leaf: &Leaf<3>, edge: Edge) -> Option<usize> {
+        if leaf.split == NO_SPLIT {
+            return None;
+        }
+        let a = self.splits[leaf.split as usize].apex[edge.index()];
+        (a != NO_APEX).then(|| leaf.index + a as usize)
+    }
+
     /// Checks the set of 8 children starting at the given index for completion
     ///
     /// If all are empty or full, then pro-actively collapses the cells (freeing
@@ -333,13 +402,16 @@ impl Octree {
         // If all of the branches are empty or full, then we're going to
         // record an Empty or Full cell in the parent and don't need the
         // 8x children.  Drop them by resizing the array
+        let collapsed = if full_count == 8 || empty_count == 8 || !self.collapse {
+            None
+        } else {
+            self.try_collapse(cell, index, hermite_data, hermite)
+        };
         let out = if full_count == 8 {
             Cell::Full
         } else if empty_count == 8 {
             Cell::Empty
-        } else if let Some(leaf) =
-            self.try_collapse(cell, index, hermite_data, hermite)
-        {
+        } else if let Some(leaf) = collapsed {
             Cell::Leaf(leaf)
         } else {
             Cell::Branch { index }
@@ -386,15 +458,21 @@ impl Octree {
         //   have been collapsed into a single empty / full cell
         // - The interior vertices *do not* match, in which case the
         //   cell should not be marked as collapsible.
-        let (pos, new_err) = hermite.solve();
+        let (pos, new_err) = if self.bounded {
+            hermite.solve_in(&cell.bounds)
+        } else {
+            hermite.solve()
+        };
         if new_err >= hermite.qef_err * 2.0 || !cell.bounds.contains(pos) {
             return None;
         }
         // Record the newly-collapsed leaf
         hermite.qef_err = new_err;
+        crate::stats::COLLAPSES.fetch_add(1, Relaxed);
 
         let index = self.verts.len();
         self.verts.push(pos);
+        self.vert_rank.push(hermite.rank());
 
         // Install cell intersections, of which there must only
         // be one (since we only collapse manifold cells)
@@ -403,9 +481,10 @@ impl Octree {
         for e in edges[0] {
             let i = hermite.intersections[e.to_undirected().index()];
             self.verts.push(CellVertex { pos: i.pos.xyz() });
+            self.vert_rank.push(0);
         }
 
-        Some(Leaf { mask, index })
+        Some(Leaf { mask, index, split: NO_SPLIT })
     }
 
     /// Checks whether the set of 8 cells beginning at `root` can be collapsed.
@@ -419,8 +498,10 @@ impl Octree {
         let mut mask = 0;
         for (i, &c) in cells.iter().enumerate() {
             let b = match c {
-                Cell::Leaf(Leaf { mask, .. }) => {
-                    if CELL_TO_VERT_TO_EDGES[mask.index()].len() > 1 {
+                Cell::Leaf(Leaf { mask, split, .. }) => {
+                    if split != NO_SPLIT
+                        || CELL_TO_VERT_TO_EDGES[mask.index()].len() > 1
+                    {
                         return None;
                     }
                     (mask.index() & (1 << i) != 0) as u8
@@ -1047,20 +1128,24 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                 debug_assert!(search[0] < 0.0);
                 debug_assert!(search[EDGE_SEARCH_SIZE - 1] >= 0.0);
 
-                // Safe guards: `find` returning None (FMA ULP flip at the
-                // boundary) or frac==0 (start already outside) both skip
-                // refinement for this iteration — same logic as
-                // flush_deferred_leaves Phase 3.
-                let Some((frac, _)) = search
-                    .iter()
-                    .enumerate()
-                    .find(|(_i, v)| **v >= 0.0)
-                else {
-                    continue;
+                // A sample may disagree in sign with the corner it was
+                // taken from: the same position can round differently
+                // between the corner batch and this batch.  The crossing is
+                // then at that end of the window within rounding, so the
+                // window collapses onto it instead of being left unrefined.
+                let frac = match search.iter().position(|v| *v >= 0.0) {
+                    None => {
+                        crate::stats::EDGE_SEARCH_FLIPS.fetch_add(1, Relaxed);
+                        *start = *end;
+                        continue;
+                    }
+                    Some(0) => {
+                        crate::stats::EDGE_SEARCH_FLIPS.fetch_add(1, Relaxed);
+                        *end = *start;
+                        continue;
+                    }
+                    Some(frac) => frac,
                 };
-                if frac == 0 {
-                    continue;
-                }
                 debug_assert!(frac < EDGE_SEARCH_SIZE);
 
                 let f = |frac| {
@@ -1111,14 +1196,26 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
             .eval_v(eval.g_tape(&mut self.tape_storage), xs, ys, zs, vars)
             .unwrap();
 
-        let mut verts: arrayvec::ArrayVec<_, 4> = arrayvec::ArrayVec::new();
+        let n_table_verts = CELL_TO_VERT_TO_EDGES[mask.index()].len();
+        let n_samples = intersections.len();
+        let mut verts: arrayvec::ArrayVec<(CellVertex<3>, u8), 4> =
+            arrayvec::ArrayVec::new();
+        let mut extras: arrayvec::ArrayVec<(CellVertex<3>, u8), 8> =
+            arrayvec::ArrayVec::new();
+        let mut edge_map = [0u8; 12];
+        let mut apex_map = [NO_APEX; 12];
+        let mut any_split = false;
         let mut i = 0;
         for vs in CELL_TO_VERT_TO_EDGES[mask.index()].iter() {
+            let component = verts.len() as u8;
+            let mut samples: arrayvec::ArrayVec<Sample, 12> =
+                arrayvec::ArrayVec::new();
             let mut force_point = None;
-            let mut qef = QuadraticErrorSolver::new();
             for e in vs.iter() {
                 let pos = nalgebra::Vector3::new(xs[i].v, ys[i].v, zs[i].v);
                 let grad: nalgebra::Vector4<f32> = grads[i].into();
+                i += 1;
+                edge_map[e.to_undirected().index()] = component;
 
                 // If a point has invalid gradients, then it's _probably_ on a
                 // sharp feature in the mesh, so we should just snap to that
@@ -1126,10 +1223,11 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                 // instead mark it as invalid.
                 if grad.iter().any(|f| f.is_nan()) {
                     force_point = Some(pos);
+                    crate::stats::NAN_SNAPS.fetch_add(1, Relaxed);
                     hermite_cell.qef_err = QEF_ERR_INVALID;
-                    break;
+                    continue;
                 }
-                qef.add_intersection(pos, grad);
+                samples.push(Sample { pos, grad });
 
                 // Record this intersection in the Hermite data for the leaf
                 let edge_index = e.to_undirected().index();
@@ -1137,32 +1235,73 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                     pos: nalgebra::Vector4::new(pos.x, pos.y, pos.z, 1.0),
                     grad,
                 };
-
-                i += 1;
             }
 
             if let Some(pos) = force_point {
-                verts.push(CellVertex { pos });
+                verts.push((CellVertex { pos }, 0));
+                continue;
+            }
+            let placed = place_component(
+                &samples,
+                vs,
+                mask,
+                &cell.bounds,
+                self.octree.bounded,
+            );
+            verts.push(placed.verts[0]);
+            if placed.verts.len() > 1 {
+                // A vertex per sheet: the first keeps the component's slot,
+                // the others go after the edge vertices.
+                any_split = true;
+                for (k, e) in vs.iter().enumerate() {
+                    let owner = placed.owner[k] as usize;
+                    if owner > 0 {
+                        edge_map[e.to_undirected().index()] =
+                            (n_table_verts + n_samples + extras.len() + owner - 1)
+                                as u8;
+                    }
+                }
+                for extra in placed.verts.iter().skip(1) {
+                    extras.push(*extra);
+                }
+                if let Some(apex) = placed.apex {
+                    let slot = (n_table_verts + n_samples + extras.len()) as u8;
+                    for e in vs.iter() {
+                        apex_map[e.to_undirected().index()] = slot;
+                    }
+                    extras.push((apex, 2));
+                }
+                hermite_cell.qef_err = QEF_ERR_INVALID;
             } else {
-                let (pos, err) = qef.solve();
-                verts.push(pos);
-
                 // We overwrite the error here, because it's only used when
                 // collapsing cells, which only occurs if there's a single
                 // vertex; last-error-wins works fine in that case.
-                hermite_cell.qef_err = err;
+                hermite_cell.qef_err = placed.err;
             }
         }
 
         let index = self.octree.verts.len();
-        self.octree.verts.extend(verts);
-        self.octree.verts.extend(
-            intersections
-                .into_iter()
-                .map(|pos| CellVertex { pos: cell.pos(pos) }),
-        );
+        for (v, r) in &verts {
+            self.octree.verts.push(*v);
+            self.octree.vert_rank.push(*r);
+        }
+        for pos in intersections {
+            self.octree.verts.push(CellVertex { pos: cell.pos(pos) });
+            self.octree.vert_rank.push(0);
+        }
+        for (v, r) in &extras {
+            self.octree.verts.push(*v);
+            self.octree.vert_rank.push(*r);
+        }
+        let split = if any_split {
+            let i = self.octree.splits.len() as u32;
+            self.octree.splits.push(SplitMap { vert: edge_map, apex: apex_map });
+            i
+        } else {
+            NO_SPLIT
+        };
 
-        Cell::Leaf(Leaf { mask, index })
+        Cell::Leaf(Leaf { mask, index, split })
     }
 
     /// Z1: processes all queued leaves in a single pipelined pass.
@@ -1360,34 +1499,22 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                 debug_assert!(search[0] < 0.0);
                 debug_assert!(search[EDGE_SEARCH_SIZE - 1] >= 0.0);
 
-                // Guard 1: find the first outside (non-negative) sample.
-                //
-                // `find` returns `None` when `search[EDGE_SEARCH_SIZE-1]`
-                // evaluates as negative in this iteration even though it was
-                // positive in the Phase-1 corner eval.  This can happen due
-                // to SIMD FMA rounding: the same f32 position yields an
-                // opposite-sign ULP result when it lands in a different AVX
-                // lane across iterations.  Skipping the update for this edge
-                // (leaving start/end unchanged) is safe — Phase 4 will still
-                // evaluate the gradient at the current midpoint, and
-                // subsequent search iterations may resolve the crossing.
-                let Some((frac, _)) = search
-                    .iter()
-                    .enumerate()
-                    .find(|(_, v)| **v >= 0.0)
-                else {
-                    continue;
+                // See the scalar `leaf()` search: a sample that disagrees in
+                // sign with its corner puts the crossing at that end of the
+                // window within rounding, so the window collapses onto it.
+                let frac = match search.iter().position(|v| *v >= 0.0) {
+                    None => {
+                        crate::stats::EDGE_SEARCH_FLIPS.fetch_add(1, Relaxed);
+                        edge.start = edge.end;
+                        continue;
+                    }
+                    Some(0) => {
+                        crate::stats::EDGE_SEARCH_FLIPS.fetch_add(1, Relaxed);
+                        edge.end = edge.start;
+                        continue;
+                    }
+                    Some(frac) => frac,
                 };
-
-                // Guard 2: frac == 0 means search[0] >= 0, i.e. the edge
-                // start is already outside — orientation is backwards or the
-                // crossing is before the current window.  Attempting
-                // `f(frac - 1)` with frac=0 would underflow to usize::MAX
-                // (silently in release builds), producing garbage coordinates.
-                // Skip the update so the window stays stable.
-                if frac == 0 {
-                    continue;
-                }
                 debug_assert!(frac < EDGE_SEARCH_SIZE);
 
                 let f = |frac| {
@@ -1452,30 +1579,41 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
             // Per-leaf hermite data we're about to fill in.  Starts blank.
             let mut hermite_cell = LeafHermiteData::default();
 
-            let mut verts: arrayvec::ArrayVec<CellVertex<3>, 4> =
+            let n_table_verts = CELL_TO_VERT_TO_EDGES[mask.index()].len();
+            let mut verts: arrayvec::ArrayVec<(CellVertex<3>, u8), 4> =
                 arrayvec::ArrayVec::new();
+            let mut extras: arrayvec::ArrayVec<(CellVertex<3>, u8), 8> =
+                arrayvec::ArrayVec::new();
+            let mut edge_map = [0u8; 12];
+            let mut apex_map = [NO_APEX; 12];
+            let mut any_split = false;
             let mut cursor = 0usize;
             for vs in CELL_TO_VERT_TO_EDGES[mask.index()].iter() {
+                let component = verts.len() as u8;
+                let mut samples: arrayvec::ArrayVec<Sample, 12> =
+                    arrayvec::ArrayVec::new();
                 let mut force_point: Option<nalgebra::Vector3<f32>> = None;
-                let mut qef = QuadraticErrorSolver::new();
                 for e in vs.iter() {
                     let global = base + cursor;
+                    cursor += 1;
                     let pos = nalgebra::Vector3::new(
                         grad_xs[global].v,
                         grad_ys[global].v,
                         grad_zs[global].v,
                     );
                     let grad: nalgebra::Vector4<f32> = grads[global].into();
+                    edge_map[e.to_undirected().index()] = component;
 
                     if grad.iter().any(|f| f.is_nan()) {
                         // Match scalar leaf()'s NaN handling: force-point
                         // the vertex and mark hermite as QEF_ERR_INVALID so
                         // `merge` rejects this subtree for collapsing.
                         force_point = Some(pos);
+                        crate::stats::NAN_SNAPS.fetch_add(1, Relaxed);
                         hermite_cell.qef_err = QEF_ERR_INVALID;
-                        break;
+                        continue;
                     }
-                    qef.add_intersection(pos, grad);
+                    samples.push(Sample { pos, grad });
 
                     // Record this intersection in the leaf's hermite data,
                     // using the same edge-index convention scalar leaf()
@@ -1488,24 +1626,54 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                             ),
                             grad,
                         };
-
-                    cursor += 1;
                 }
 
                 if let Some(pos) = force_point {
-                    verts.push(CellVertex { pos });
+                    verts.push((CellVertex { pos }, 0));
+                    continue;
+                }
+                let placed = place_component(
+                    &samples,
+                    vs,
+                    *mask,
+                    &dl.cell.bounds,
+                    self.octree.bounded,
+                );
+                verts.push(placed.verts[0]);
+                if placed.verts.len() > 1 {
+                    any_split = true;
+                    for (k, e) in vs.iter().enumerate() {
+                        let owner = placed.owner[k] as usize;
+                        if owner > 0 {
+                            edge_map[e.to_undirected().index()] =
+                                (n_table_verts + n_edges + extras.len() + owner - 1)
+                                    as u8;
+                        }
+                    }
+                    for extra in placed.verts.iter().skip(1) {
+                        extras.push(*extra);
+                    }
+                    if let Some(apex) = placed.apex {
+                        let slot = (n_table_verts + n_edges + extras.len()) as u8;
+                        for e in vs.iter() {
+                            apex_map[e.to_undirected().index()] = slot;
+                        }
+                        extras.push((apex, 2));
+                    }
+                    hermite_cell.qef_err = QEF_ERR_INVALID;
                 } else {
-                    let (pos, err) = qef.solve();
-                    verts.push(pos);
                     // Last-error-wins, matching scalar leaf() — only
                     // meaningful when the mask has a single vertex (the
                     // only case where try_collapse actually looks at it).
-                    hermite_cell.qef_err = err;
+                    hermite_cell.qef_err = placed.err;
                 }
             }
 
             let vert_index = self.octree.verts.len();
-            self.octree.verts.extend(verts);
+            for (v, r) in &verts {
+                self.octree.verts.push(*v);
+                self.octree.vert_rank.push(*r);
+            }
             // Append the per-edge intersection positions — these serve as the
             // edge vertices that `walk_dual` emits on boundary edges, and
             // must match the order of the intersections produced inside the
@@ -1518,11 +1686,24 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
                     grad_zs[global].v,
                 );
                 self.octree.verts.push(CellVertex { pos });
+                self.octree.vert_rank.push(0);
             }
+            for (v, r) in &extras {
+                self.octree.verts.push(*v);
+                self.octree.vert_rank.push(*r);
+            }
+            let split = if any_split {
+                let i = self.octree.splits.len() as u32;
+                self.octree.splits.push(SplitMap { vert: edge_map, apex: apex_map });
+                i
+            } else {
+                NO_SPLIT
+            };
 
             self.octree[dl.cell] = Cell::Leaf(Leaf {
                 mask: *mask,
                 index: vert_index,
+                split,
             });
 
             // Publish hermite to the parent's slot so collapse_subtree can
@@ -1538,6 +1719,332 @@ impl<F: Function + RenderHints> OctreeBuilder<F> {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+/// One crossing of the surface on an edge of a leaf
+#[derive(Copy, Clone, Debug)]
+struct Sample {
+    pos: nalgebra::Vector3<f32>,
+    /// Gradient in xyz, field value in w
+    grad: nalgebra::Vector4<f32>,
+}
+
+/// The vertices placed for one sign component of a leaf
+struct Placed {
+    /// Vertices with the rank of the solve that placed them.  The first is
+    /// the component's vertex; any others belong to further sheets.
+    verts: arrayvec::ArrayVec<(CellVertex<3>, u8), 4>,
+    /// For each sample, the index into `verts` of the vertex its edge
+    /// belongs to
+    owner: arrayvec::ArrayVec<u8, 12>,
+    /// QEF error of the component's vertex, or `QEF_ERR_INVALID` when the
+    /// component was split
+    err: f32,
+    /// The crease or corner the sheets of a split component meet at, when
+    /// it is strongly supported and within `APEX_MARGIN` of the cell
+    apex: Option<CellVertex<3>>,
+}
+
+/// Cosine of the smallest angle between the mean normals of two groups of
+/// crossings for them to count as two sheets (25 degrees)
+const SHEET_SPLIT_COS: f32 = 0.906;
+
+/// Largest distance, in cells, from the fallback vertex to the plane of any
+/// crossing at which the fallback is kept rather than split by sheet
+const FALLBACK_RESIDUAL: f32 = 0.35;
+
+/// Fraction of the cell's width by which the region of a sheet vertex is
+/// inset from the cell's faces
+const SHEET_INSET: f32 = 0.05;
+
+/// How far outside the cell, in cells, the crease apex of a split component
+/// may lie and still be used by the stitch polygons
+const APEX_MARGIN: f32 = 1.25;
+
+/// Places the vertex (or vertices) of one sign component
+///
+/// The component's QEF is solved within the cell.  When that fails, i.e. the
+/// planes through the crossings meet outside the cell beyond what a feature
+/// is allowed, the crossings are checked for lying on two sheets, two faces
+/// of a crease that runs past the cell or the two walls of a thin feature.
+/// Each sheet then receives its own strictly contained vertex, which is the
+/// case Manifold Dual Contouring's one-vertex-per-sign-component rule
+/// cannot represent and the cause of folded crease cells.
+fn place_component(
+    samples: &[Sample],
+    edges: &[DirectedEdge],
+    mask: CellMask<3>,
+    bounds: &CellBounds<3>,
+    bounded: bool,
+) -> Placed {
+    debug_assert_eq!(samples.len(), edges.len());
+    let mut qef = QuadraticErrorSolver::new();
+    for s in samples {
+        qef.add_intersection(s.pos, s.grad);
+    }
+    let rank = qef.rank();
+    let single = |v: CellVertex<3>, err: f32| Placed {
+        verts: [(v, rank)].into_iter().collect(),
+        owner: samples.iter().map(|_| 0u8).collect(),
+        err,
+        apex: None,
+    };
+    if !bounded {
+        let (v, err) = qef.solve();
+        crate::stats::record(Placement::Interior);
+        return single(v, err);
+    }
+    let (v, err, how) = qef.solve_in(bounds);
+    if how == Placement::Interior {
+        crate::stats::record(how);
+        return single(v, err);
+    }
+    // The fallback vertex is kept when it lies close to every sheet: the
+    // sheets then meet in a thin wedge or slab, and a vertex between them
+    // closes it sharply, one cell early at worst.  Only a vertex that would
+    // stand well off one of the sheets, the spike on the rim of a hole, is
+    // worth a vertex per sheet.
+    let width = bounds.bounds[0].width().max(1e-30);
+    let residual = samples
+        .iter()
+        .map(|s| match s.grad.xyz().try_normalize(1e-12) {
+            Some(n) => n.dot(&(v.pos - s.pos)).abs() / width,
+            None => 0.0,
+        })
+        .fold(0.0_f32, f32::max);
+    if residual <= FALLBACK_RESIDUAL {
+        crate::stats::record(how);
+        return single(v, err);
+    }
+    let split = split_sheets(samples, edges, mask);
+    if let Some((owner, groups)) = split {
+        // The sheets of a single loop meet at the feature the whole
+        // component's QEF describes; it is kept for the stitch polygons
+        // when it lies within reach, so a crease just past the margin
+        // stays an edge of the mesh instead of a chamfer.
+        let apex = (groups == 2 && loops_of(edges, mask).len() == 1)
+            .then(|| qef.feature_point())
+            .flatten()
+            .filter(|p| crate::qef::excess(bounds, p) <= APEX_MARGIN)
+            .map(|pos| CellVertex { pos });
+        let mut placed = Placed {
+            verts: arrayvec::ArrayVec::new(),
+            owner,
+            err: QEF_ERR_INVALID,
+            apex,
+        };
+        // Sheet vertices stay clear of the cell's faces, where they would
+        // sit in the polygons of the neighbouring cells
+        let inset = CellBounds {
+            bounds: bounds.bounds.map(|b| {
+                let d = SHEET_INSET * b.width();
+                Interval::new(b.lower() + d, b.upper() - d)
+            }),
+        };
+        for g in 0..groups {
+            let mut q = QuadraticErrorSolver::new();
+            for (s, &o) in samples.iter().zip(placed.owner.iter()) {
+                if o == g {
+                    q.add_intersection(s.pos, s.grad);
+                }
+            }
+            let (v, _, _) = q.solve_contained(&inset);
+            placed.verts.push((v, q.rank()));
+        }
+        crate::stats::SPLITS.fetch_add(1, Relaxed);
+        return placed;
+    }
+    crate::stats::record(how);
+    single(v, err)
+}
+
+/// The loops that a component's crossings form on the cell's boundary
+///
+/// Two crossings follow one another when they lie on a common face and
+/// belong to the same run of inside corners along that face's boundary, the
+/// same rule by which `dc::stitch_face` pairs them.  Every crossing has two
+/// such neighbours, so the crossings fall into cycles; each is returned in
+/// cyclic order as indices into `edges`.
+fn loops_of(
+    edges: &[DirectedEdge],
+    mask: CellMask<3>,
+) -> arrayvec::ArrayVec<arrayvec::ArrayVec<u8, 12>, 4> {
+    let n = edges.len();
+    let mut next: [[Option<u8>; 2]; 12] = [[None; 2]; 12];
+    let mut link = |i: usize, j: usize| {
+        for (a, b) in [(i, j), (j, i)] {
+            let slot = &mut next[a];
+            if slot[0].is_none() {
+                slot[0] = Some(b as u8);
+            } else if slot[1].is_none() {
+                slot[1] = Some(b as u8);
+            }
+        }
+    };
+    for axis in [1u8, 2, 4] {
+        for side in [false, true] {
+            // Runs of inside corners along this face's boundary
+            let on_face = |c: u8| ((c & axis) != 0) == side;
+            let inside = |c: u8| mask & Corner::new(c);
+            let mut label = [0u8, 1, 2, 3, 4, 5, 6, 7];
+            loop {
+                let mut changed = false;
+                for c in 0..8u8 {
+                    if !on_face(c) || !inside(c) {
+                        continue;
+                    }
+                    for bit in [1u8, 2, 4] {
+                        if bit == axis {
+                            continue;
+                        }
+                        let d = c ^ bit;
+                        if inside(d) && label[c as usize] != label[d as usize] {
+                            let m = label[c as usize].min(label[d as usize]);
+                            label[c as usize] = m;
+                            label[d as usize] = m;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            // Crossings on this face, grouped by the run of their inside
+            // corner (the start of a directed edge is inside)
+            let mut first: [Option<usize>; 8] = [None; 8];
+            for (k, e) in edges.iter().enumerate() {
+                let (s, t) = (e.start().get(), e.end().get());
+                if !(on_face(s) && on_face(t)) {
+                    continue;
+                }
+                let run = label[s as usize] as usize;
+                match first[run] {
+                    None => first[run] = Some(k),
+                    Some(j) => link(j, k),
+                }
+            }
+        }
+    }
+    let mut out = arrayvec::ArrayVec::new();
+    let mut seen = [false; 12];
+    for start in 0..n {
+        if seen[start] {
+            continue;
+        }
+        let mut cycle: arrayvec::ArrayVec<u8, 12> = arrayvec::ArrayVec::new();
+        let (mut prev, mut cur) = (None, start);
+        loop {
+            seen[cur] = true;
+            cycle.push(cur as u8);
+            let [a, b] = next[cur];
+            let step = match (a, b) {
+                (Some(a), Some(b)) if Some(a as usize) == prev => b,
+                (Some(a), _) if Some(a as usize) != prev => a,
+                (_, Some(b)) => b,
+                _ => break,
+            } as usize;
+            prev = Some(cur);
+            cur = step;
+            if cur == start || seen[cur] {
+                break;
+            }
+        }
+        if out.try_push(cycle).is_err() {
+            break;
+        }
+    }
+    out
+}
+
+/// Divides a component's crossings into sheets, when its vertex could not be
+/// placed: the loops they form when there are several, otherwise the two
+/// arcs of the single loop whose normals differ the most, provided the arcs'
+/// mean normals are more than [`SHEET_SPLIT_COS`] apart.  Returns the sheet
+/// of each crossing and the number of sheets, or `None` to leave the
+/// component whole.
+///
+/// Sheets are arcs of loops so that on every face the two crossings of a
+/// run of inside corners stay together, except across the ends of an arc;
+/// `dc::stitch_face` closes those two seams, and no mesh edge is used by
+/// more than two polygons.
+fn split_sheets(
+    samples: &[Sample],
+    edges: &[DirectedEdge],
+    mask: CellMask<3>,
+) -> Option<(arrayvec::ArrayVec<u8, 12>, u8)> {
+    let n = samples.len();
+    if n < 2 {
+        return None;
+    }
+    let loops = loops_of(edges, mask);
+    let mut owner: arrayvec::ArrayVec<u8, 12> =
+        samples.iter().map(|_| 0u8).collect();
+    if loops.len() > 1 {
+        if loops.len() > 4 {
+            return None;
+        }
+        for (g, cycle) in loops.iter().enumerate() {
+            for &k in cycle {
+                owner[k as usize] = g as u8;
+            }
+        }
+        return Some((owner, loops.len() as u8));
+    }
+    let cycle = loops.first()?;
+    if cycle.len() != n || n < 3 {
+        return None;
+    }
+    let mut normals: arrayvec::ArrayVec<nalgebra::Vector3<f32>, 12> =
+        arrayvec::ArrayVec::new();
+    for &k in cycle {
+        // A crossing without a usable normal says nothing about sheets
+        normals.push(samples[k as usize].grad.xyz().try_normalize(1e-12)?);
+    }
+    // The arc [i, i + len) against the rest: least total spread about the
+    // two mean normals.  An arc of one crossing is allowed: a cell with a
+    // single inside corner has three crossings, two on one sheet and one on
+    // the other.
+    let mut best: Option<(f32, usize, usize)> = None;
+    for i in 0..n {
+        for len in 1..=(n - 1) {
+            let mut sa = nalgebra::Vector3::zeros();
+            let mut sb = nalgebra::Vector3::zeros();
+            for j in 0..n {
+                let in_arc = (j + n - i) % n < len;
+                if in_arc {
+                    sa += normals[j];
+                } else {
+                    sb += normals[j];
+                }
+            }
+            // Spread of unit vectors about their mean: n - |sum|
+            let cost = (len as f32 - sa.norm()) + ((n - len) as f32 - sb.norm());
+            if best.is_none_or(|(c, _, _)| cost < c) {
+                best = Some((cost, i, len));
+            }
+        }
+    }
+    let (_, i, len) = best?;
+    let mut sa = nalgebra::Vector3::zeros();
+    let mut sb = nalgebra::Vector3::zeros();
+    for j in 0..n {
+        if (j + n - i) % n < len {
+            sa += normals[j];
+        } else {
+            sb += normals[j];
+        }
+    }
+    let (a, b) = (sa.try_normalize(1e-12)?, sb.try_normalize(1e-12)?);
+    if a.dot(&b) > SHEET_SPLIT_COS {
+        return None;
+    }
+    for j in 0..n {
+        if (j + n - i) % n >= len {
+            owner[cycle[j] as usize] = 1;
+        }
+    }
+    Some((owner, 2))
+}
 
 #[derive(Copy, Clone, Default, Debug)]
 struct LeafIntersection {
@@ -1697,6 +2204,21 @@ impl LeafHermiteData {
 
     /// Solves the combined QEF.
     pub fn solve(&self) -> (CellVertex<3>, f32) {
+        self.combined().solve()
+    }
+
+    /// Solves the combined QEF, keeping the vertex within `bounds`.
+    pub fn solve_in(&self, bounds: &CellBounds<3>) -> (CellVertex<3>, f32) {
+        let (v, err, _) = self.combined().solve_in(bounds);
+        (v, err)
+    }
+
+    /// Rank of the combined QEF
+    pub fn rank(&self) -> u8 {
+        self.combined().rank()
+    }
+
+    fn combined(&self) -> QuadraticErrorSolver {
         let mut qef = self.center_qef;
         for &i in &self.intersections {
             qef += i.into();
@@ -1704,7 +2226,7 @@ impl LeafHermiteData {
         for &f in &self.face_qefs {
             qef += f;
         }
-        qef.solve()
+        qef
     }
 }
 
@@ -1713,6 +2235,7 @@ impl LeafHermiteData {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::Triangulation;
     use crate::types::{Edge, X, Y, Z};
     use fidget_core::{
         context::{Context, Tree},
@@ -1832,7 +2355,7 @@ mod test {
 
         // Each cell is a leaf with 4 vertices (3 edges, 1 center)
         for o in octree.cells[0].iter() {
-            let Cell::Leaf(Leaf { index, mask }) = *o else {
+            let Cell::Leaf(Leaf { index, mask, .. }) = *o else {
                 panic!()
             };
             assert_eq!(mask.count_ones(), 1);
@@ -1848,7 +2371,13 @@ mod test {
     fn test_sphere_verts() {
         let shape = VmShape::from(sphere([0.0; 3], 0.2));
 
-        let octree = Octree::build(&shape, &depth1_single_thread()).unwrap();
+        // The edge vertices only reach the mesh through the fan
+        // triangulation; the quad split and the hybrid leave them out.
+        let settings = Settings {
+            triangulation: Triangulation::Fan,
+            ..depth1_single_thread()
+        };
+        let octree = Octree::build(&shape, &settings).unwrap();
         let sphere_mesh = octree.walk_dual();
 
         let mut edge_count = 0;
@@ -1979,11 +2508,66 @@ mod test {
     }
 
     #[test]
+    fn test_loops_of() {
+        // One inside corner: its three crossings form one loop
+        let mask = CellMask::new(0b0000_0001);
+        let edges = CELL_TO_VERT_TO_EDGES[mask.index()];
+        assert_eq!(edges.len(), 1);
+        let loops = loops_of(edges[0], mask);
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].len(), 3);
+
+        // Two opposite outside corners (1 and 6): the inside corners are
+        // connected, so the table gives one vertex, but the surface forms
+        // two loops of three crossings each
+        let mask = CellMask::new(!((1 << 1) | (1 << 6)));
+        let edges = CELL_TO_VERT_TO_EDGES[mask.index()];
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].len(), 6);
+        let loops = loops_of(edges[0], mask);
+        assert_eq!(loops.len(), 2);
+        assert!(loops.iter().all(|l| l.len() == 3));
+
+        // Bottom face inside: one loop of four, in cyclic order
+        let mask = CellMask::new(0b0000_1111);
+        let edges = CELL_TO_VERT_TO_EDGES[mask.index()];
+        assert_eq!(edges.len(), 1);
+        let loops = loops_of(edges[0], mask);
+        assert_eq!(loops.len(), 1);
+        let cycle = &loops[0];
+        assert_eq!(cycle.len(), 4);
+        for w in 0..4 {
+            let a = edges[0][cycle[w] as usize].start().get();
+            let b = edges[0][cycle[(w + 1) % 4] as usize].start().get();
+            assert_eq!(
+                (a ^ b).count_ones(),
+                1,
+                "consecutive crossings must share a face edge"
+            );
+        }
+
+        // Every mask: each loop has at least three crossings and together
+        // they cover the component once
+        for m in 1..255u8 {
+            let mask = CellMask::new(m);
+            for vs in CELL_TO_VERT_TO_EDGES[mask.index()] {
+                let loops = loops_of(vs, mask);
+                let total: usize = loops.iter().map(|l| l.len()).sum();
+                assert_eq!(total, vs.len(), "mask {m:#010b}");
+                assert!(loops.iter().all(|l| l.len() >= 3), "mask {m:#010b}");
+            }
+        }
+    }
+
+    #[test]
     fn test_cone_vert() {
-        // Test both in-cell and out-of-cell cone vertices
-        for tip in [
-            nalgebra::Vector3::new(0.2, 0.3, 0.4),
-            nalgebra::Vector3::new(1.2, 1.3, 1.4),
+        // Test both in-cell and out-of-cell cone vertices.  The in-cell tip
+        // is reproduced; the out-of-cell tip gives a vertex that stays
+        // within the cell (on its boundary), since vertices no longer leave
+        // their cells.
+        for (tip, in_cell) in [
+            (nalgebra::Vector3::new(0.2, 0.3, 0.4), true),
+            (nalgebra::Vector3::new(1.2, 1.3, 1.4), false),
         ] {
             let corner = nalgebra::Vector3::new(-1.0, -1.0, -1.0);
             let shape = VmShape::from(cone(corner, tip, 0.1));
@@ -1999,13 +2583,34 @@ mod test {
             let octree =
                 Octree::build(&shape, &depth0_single_thread()).unwrap();
             assert!(octree.cells.is_empty()); // root only
-            assert_eq!(octree.verts.len(), 4);
 
             let pos = octree.verts[0].pos;
-            assert!(
-                (pos - tip).norm() < 1e-3,
-                "bad vertex position: expected {tip:?}, got {pos:?}"
-            );
+            if in_cell {
+                assert_eq!(octree.verts.len(), 4);
+                assert!(
+                    (pos - tip).norm() < 1e-3,
+                    "bad vertex position: expected {tip:?}, got {pos:?}"
+                );
+            } else {
+                // The tip is a weak corner (the cone's normals are nearly
+                // coplanar), so the vertex may not follow it out of the
+                // cell; the crossings then split into a vertex per sheet.
+                // Either way every cell vertex stays within the cell.
+                assert!(
+                    octree.verts.len() == 4 || octree.verts.len() == 5,
+                    "unexpected vertex count {}",
+                    octree.verts.len()
+                );
+                for v in std::iter::once(&octree.verts[0])
+                    .chain(octree.verts.iter().skip(4))
+                {
+                    assert!(
+                        v.pos.iter().all(|c| c.abs() <= 1.0 + 1e-3),
+                        "vertex left the cell: {:?}",
+                        v.pos
+                    );
+                }
+            }
         }
     }
 
